@@ -1,0 +1,13 @@
+Commercial License Placeholder
+
+This software is available under a dual-licensing model.
+
+1. MIT License (see LICENSE file) – free use, modification, and distribution.
+
+2. Commercial License – for organizations or individuals who require
+   additional features, support, warranties, or proprietary integration.
+
+If you are interested in obtaining a commercial license, please contact:
+📧 hoyiwan@example.com
+
+© 2025 Ho Yi Wan & Logan Hysen. All rights reserved.
