@@ -1,0 +1,8 @@
+gradio==5.43.1
+pandas
+numpy
+scipy
+statsmodels
+matplotlib
+python-dotenv
+together
