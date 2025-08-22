@@ -1,5 +1,5 @@
 ---
-title: SpatChat – Stats Room
+title: SpatChat Stats
 emoji: 📊
 colorFrom: indigo
 colorTo: blue
