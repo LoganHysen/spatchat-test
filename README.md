@@ -1,5 +1,5 @@
 ---
-title: SpatChat Stats
+title: Spatchat Stats
 emoji: 📊
 colorFrom: indigo
 colorTo: blue
