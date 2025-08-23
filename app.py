@@ -39,8 +39,10 @@ SPATCHAT_LLM_ENABLED = os.getenv("SPATCHAT_LLM_ENABLED", "1") == "1"
 SPATCHAT_LLM_MODEL = os.getenv("SPATCHAT_LLM_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free")
 LLM_COOLDOWN_SEC = float(os.getenv("SPATCHAT_LLM_COOLDOWN_SEC", "2.0"))
 LLM_MAX_RETRIES = int(os.getenv("SPATCHAT_LLM_MAX_RETRIES", "2"))
-SPATCHAT_HUMANIZE_RECS = os.getenv("SPATCHAT_HUMANIZE_RECS", "1") == "1"
-SPATCHAT_HUMANIZE_RESULTS = os.getenv("SPATCHAT_HUMANIZE_RESULTS", "1") == "1"
+
+# By default we DO NOT humanize with LLM to avoid surprises
+SPATCHAT_HUMANIZE_RECS = os.getenv("SPATCHAT_HUMANIZE_RECS", "0") == "1"
+SPATCHAT_HUMANIZE_RESULTS = os.getenv("SPATCHAT_HUMANIZE_RESULTS", "0") == "1"
 
 _llm_client = None
 _last_llm_time = 0.0
@@ -54,11 +56,11 @@ def _get_llm_client():
     _llm_client = Together(api_key=TOGETHER_API_KEY)
     return _llm_client
 
-# ---------- PROMPTS ----------
+# ---------- PROMPTS (kept minimal) ----------
 SYSTEM_PROMPT = """
 Return JSON only for tool calls:
-{"tool":"stats","action":"ttest|anova|ols|glm|plot|check|power|recommend","args":{...}}
-Args:
+{"tool":"stats","action":"ttest|anova|ols|glm|plot|check|power|recommend|desc","args":{...}}
+Args (non-exhaustive):
 - ttest {"value":"Y","group":"G","paired":false,"equal_var":false}
 - anova {"value":"Y","group":"G"}
 - ols {"formula":"y ~ x1 + x2"}
@@ -67,8 +69,8 @@ Args:
 - check {"normality":{"col":"Y"}|"homogeneity":{"value":"Y","group":"G"}}
 - power {"ttest_ind":{...}} | {"anova_oneway":{...}}
 - recommend {}
-If the user asks “what can I do with my data?” or similar, use action="recommend".
-Use minimal defaults. No prose unless not a tool call (≤3 sentences).
+- desc {"op":"mean|median|sd|min|max|range|mode|freq|summary","col":"Y","group":"G?"}
+Only use prose (≤3 sentences) when not a tool call.
 """.strip()
 
 FALLBACK_PROMPT = "You are SpatChat, a concise statistics tutor. If not a tool call, answer helpfully in ≤3 sentences."
@@ -119,11 +121,10 @@ def _is_count_series(s: pd.Series) -> bool:
         return False
     return np.all(np.floor(s.astype(float)) == s.astype(float))
 
-# ---------- ID-like detection & usable numeric ----------
+# ---------- ID-like detection ----------
 ID_NAME_PAT = re.compile(r"(?:^|[_\W])(id|identifier|index|subject|animal|record|row)(?:[_\W]|$)", re.I)
 
 def is_id_like(df: pd.DataFrame, col: str) -> bool:
-    """Heuristics: name pattern, very high uniqueness, or sequential integers."""
     name = str(col).strip().lower()
     if ID_NAME_PAT.search(name) or name.endswith("_id"):
         return True
@@ -139,36 +140,34 @@ def is_id_like(df: pd.DataFrame, col: str) -> bool:
     s_int = s.astype(float)
     if np.all(np.floor(s_int) == s_int):
         u = np.sort(pd.unique(s_int))
-        if len(u) > 4:
-            if int(u[-1] - u[0] + 1) == len(u):
-                return True
+        if len(u) > 4 and int(u[-1] - u[0] + 1) == len(u):
+            return True
     return False
 
 def usable_numeric_cols(df: pd.DataFrame) -> List[str]:
-    """Numeric columns excluding those that look like identifiers (for auto defaults)."""
     return [c for c in numeric_cols(df) if not is_id_like(df, c)]
 
-# ---------- RECOMMENDATIONS ----------
+# ---------- RECOMMENDATIONS (deterministic, no LLM) ----------
 def infer_schema(df: pd.DataFrame) -> Dict[str, List[str] or int]:
     nums_all = numeric_cols(df)
     nums = usable_numeric_cols(df)
-    cat_like = []
+    cats = []
     for c in df.columns:
         if c in nums_all:
             nunq = df[c].nunique(dropna=True)
             if 2 <= nunq <= 10:
-                cat_like.append(c)
+                cats.append(c)
         else:
-            cat_like.append(c)
+            cats.append(c)
     seen = set()
-    cats = [c for c in cat_like if not (c in seen or seen.add(c))]
+    cats = [c for c in cats if not (c in seen or seen.add(c))]
     bins = [c for c in cats if df[c].nunique(dropna=True) == 2]
     y_bin = [c for c in df.columns if (pd.api.types.is_bool_dtype(df[c]) or _is_binary_series(df[c]))]
     y_count = [c for c in nums if _is_count_series(df[c]) and df[c].nunique(dropna=True) > 2]
     return {
         "n_rows": len(df),
         "n_cols": df.shape[1],
-        "numeric": nums_all,
+        "numeric_all": nums_all,
         "numeric_usable": nums,
         "categorical": cats,
         "binary_groups": bins,
@@ -176,187 +175,81 @@ def infer_schema(df: pd.DataFrame) -> Dict[str, List[str] or int]:
         "y_count": y_count,
     }
 
-def recommend_analyses_text(df: pd.DataFrame) -> str:
+def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
     info = infer_schema(df)
     n, p = info["n_rows"], info["n_cols"]
-    nums_all = info["numeric"]
     nums = info["numeric_usable"]
+    nums_all = info["numeric_all"]
     cats = info["categorical"]
     bins = info["binary_groups"]
     y_bin, y_count = info["y_bin"], info["y_count"]
 
-    lines = []
-    lines.append(f"Dataset overview: n={n} rows, p={p} columns.")
+    overview_lines = [f"Dataset overview: n={n} rows, p={p} columns."]
     if nums_all:
-        lines.append(f"- Numeric columns ({len(nums_all)}): {', '.join(map(str, nums_all[:8]))}{'…' if len(nums_all)>8 else ''}")
+        overview_lines.append(f"- Numeric columns ({len(nums_all)}): {', '.join(map(str, nums_all[:8]))}{'…' if len(nums_all)>8 else ''}")
     if cats:
-        lines.append(f"- Categorical/low-cardinality ({len(cats)}): {', '.join(map(str, cats[:8]))}{'…' if len(cats)>8 else ''}")
+        overview_lines.append(f"- Categorical/low-cardinality ({len(cats)}): {', '.join(map(str, cats[:8]))}{'…' if len(cats)>8 else ''}")
 
-    recs = []
-    if bins and nums:
-        g = bins[0]; y = next((c for c in nums if c != g), nums[0])
-        recs.append(f"• t-test: compare means of {y} across {g} (2 groups).\nTry: ttest value={y} group={g}")
-    multi_group = [c for c in cats if df[c].nunique(dropna=True) >= 3]
-    if multi_group and nums:
-        g = multi_group[0]; y = next((c for c in nums if c != g), nums[0])
-        recs.append(f"• One-way ANOVA: {y} by {g} (≥3 groups).\nTry: anova value={y} group={g}")
+    # Choose sensible defaults that are NOT ID-like
+    y_num = nums[0] if nums else (nums_all[0] if nums_all else None)
+    g_bin = bins[0] if bins else (cats[0] if cats else None)
+    g_multi = next((c for c in cats if df[c].nunique(dropna=True) >= 3), (cats[0] if cats else None))
+
+    rec_lines = ["Here are some analysis ideas you can run next:"]
+    if y_num:
+        rec_lines.append(f"• **Quick summary** of {y_num} (mean, sd, min/max).")
+        rec_lines.append(f"• **Histogram** to see the shape of {y_num}.")
+    if y_num and g_bin:
+        rec_lines.append(f"• **t-test** to compare average {y_num} between the two groups in {g_bin}.")
+    if y_num and g_multi and g_multi != g_bin:
+        rec_lines.append(f"• **One-way ANOVA** to compare {y_num} across levels of {g_multi}.")
     if len(nums) >= 2:
-        y = nums[0]; x = nums[1]
-        recs.append(f"• Regression (OLS): {y} with {x}.\nTry: ols {y} ~ {x}")
+        rec_lines.append(f"• **Linear regression (OLS)** to see how one variable predicts another (e.g., {nums[0]} ~ {nums[1]}).")
     if y_bin and len(nums) >= 1:
-        y = y_bin[0]
-        x = nums[0] if nums and nums[0] != y else (nums[1] if len(nums) > 1 else None)
+        x = nums[0] if nums[0] != y_bin[0] else (nums[1] if len(nums) > 1 else None)
         if x:
-            recs.append(f"• Logistic GLM for binary {y}.\nTry: glm {y} ~ {x} family=binomial")
+            rec_lines.append(f"• **Logistic regression** if your outcome is yes/no (e.g., {y_bin[0]} ~ {x}).")
     if y_count and len(nums) >= 1:
-        y = y_count[0]
-        x = nums[0] if nums and nums[0] != y else (nums[1] if len(nums) > 1 else None)
+        x = nums[0] if nums[0] != y_count[0] else (nums[1] if len(nums) > 1 else None)
         if x:
-            recs.append(f"• Poisson GLM for counts {y}.\nTry: glm {y} ~ {x} family=poisson")
-    if nums:
-        y = nums[0]
-        recs.append(f"• Normality check: check normality col={y}; histogram: plot hist col={y}")
-    if cats and nums:
-        y = nums[0]; g = cats[0] if cats[0] != y else (cats[1] if len(cats)>1 else cats[0])
-        recs.append(f"• Group visuals: plot box value={y} group={g} or plot violin value={y} group={g}")
-    if bins and nums:
-        y = nums[0]; g = bins[0]
-        recs.append(f"• Bar ± error: plot bar value={y} group={g} error=sem|sd|ci95")
-    if bins and nums:
-        recs.append("• Power (t-test): power ttest_ind effect_size=0.5 power=0.8")
-    if multi_group:
-        recs.append("• Power (ANOVA): power anova_oneway effect_size=0.25 k_groups=3 power=0.8")
-    if not recs:
-        recs.append("• Tell me your goal (e.g., “compare two groups on height” or “predict score from features”).")
-    lines.append("\nRecommended next steps:\n" + "\n".join(recs))
-    return "\n".join(lines)
+            rec_lines.append(f"• **Poisson regression** if your outcome is a count (e.g., {y_count[0]} ~ {x}).")
+    if y_num:
+        rec_lines.append(f"• **Normality check** of {y_num} with a QQ plot.")
+    if g_bin and y_num:
+        rec_lines.append(f"• **Bar chart with error bars** to compare mean {y_num} by {g_bin}.")
+    if g_multi and y_num:
+        rec_lines.append(f"• **Box/violin plots** to visualize {y_num} across {g_multi}.")
+    rec_lines.append("• **Power analysis** to see how many samples you need to detect a meaningful difference.")
 
-def recommend_examples_natural(df: pd.DataFrame) -> str:
-    info = infer_schema(df)
-    nums = info["numeric_usable"]
-    cats = info["categorical"]
-    bins = info["binary_groups"]
-    y_bin = info["y_bin"]
-    y_count = info["y_count"]
-
-    lines = []
-    lines.append("Here are some things you can say:")
-    if bins and nums:
-        g = bins[0]; y = next((c for c in nums if c != g), nums[0])
-        lines.append(f'• "I want to do a t-test on {y} by {g}."')
-    multi_group = [c for c in cats if df[c].nunique(dropna=True) >= 3]
-    if multi_group and nums:
-        g = multi_group[0]; y = next((c for c in nums if c != g), nums[0])
-        lines.append(f'• "Run a one-way ANOVA of {y} by {g}."')
+    # Natural-language example prompts users can literally copy
+    ex_lines = ["Here are some things you can say:"]
+    if y_num:
+        ex_lines.append(f'• "What is the average {y_num}?"')
+        ex_lines.append(f'• "Show a histogram of {y_num}."')
+    if y_num and g_bin:
+        ex_lines.append(f'• "I want to do a t-test on {y_num} by {g_bin}."')
+        ex_lines.append(f'• "Make a bar chart of {y_num} by {g_bin} with 95% CI."')
+    if y_num and g_multi and g_multi != g_bin:
+        ex_lines.append(f'• "Run a one-way ANOVA of {y_num} by {g_multi}."')
+        ex_lines.append(f'• "Show box and violin plots for {y_num} by {g_multi}."')
     if len(nums) >= 2:
-        y = nums[0]; x = nums[1]
-        lines.append(f'• "Fit a linear regression: {y} ~ {x}."')
+        ex_lines.append(f'• "Fit a linear regression: {nums[0]} ~ {nums[1]}."')
     if y_bin and len(nums) >= 1:
-        y = y_bin[0]
-        x = nums[0] if nums and nums[0] != y else (nums[1] if len(nums) > 1 else None)
+        x = nums[0] if nums[0] != y_bin[0] else (nums[1] if len(nums) > 1 else None)
         if x:
-            lines.append(f'• "Do a logistic regression: {y} ~ {x}."')
+            ex_lines.append(f'• "Do a logistic regression: {y_bin[0]} ~ {x}."')
     if y_count and len(nums) >= 1:
-        y = y_count[0]
-        x = nums[0] if nums and nums[0] != y else (nums[1] if len(nums) > 1 else None)
+        x = nums[0] if nums[0] != y_count[0] else (nums[1] if len(nums) > 1 else None)
         if x:
-            lines.append(f'• "Fit a Poisson regression for {y} using {x}."')
-    if nums:
-        y = nums[0]
-        lines.append(f'• "Check normality of {y} and show a histogram."')
-    if cats and nums:
-        y = nums[0]; g = cats[0] if cats[0] != y else (cats[1] if len(cats) > 1 else cats[0])
-        lines.append(f'• "Show box and violin plots for {y} by {g}."')
-    if bins and nums:
-        y = nums[0]; g = bins[0]
-        lines.append(f'• "Make a bar chart of {y} by {g} with 95% CI error bars."')
-    if bins and nums:
-        lines.append('• "Power analysis for a t-test with 80% power and effect size 0.5."')
-    if multi_group:
-        lines.append('• "Power analysis for a one-way ANOVA with 3 groups and 80% power."')
-    if len(lines) == 1:
-        lines.append('• "Suggest some analyses based on my columns."')
-    return "\n".join(lines)
+            ex_lines.append(f'• "Fit a Poisson regression for {y_count[0]} using {x}."')
+    if y_num:
+        ex_lines.append(f'• "Check normality of {y_num} and show a QQ plot."')
+    ex_lines.append('• "Power analysis for a t-test with 80% power and effect size 0.5."')
+    ex_lines.append('• "Power analysis for a one-way ANOVA with 3 groups and 80% power."')
 
-# ---------- LLM HUMANIZERS ----------
-def humanize_recommendations(tech_text: str, df: pd.DataFrame) -> str:
-    if not (SPATCHAT_LLM_ENABLED and SPATCHAT_HUMANIZE_RECS):
-        return tech_text
-    client = _get_llm_client()
-    if client is None:
-        return tech_text
-    schema = {
-        "rows": int(len(df)),
-        "columns": [str(c) for c in df.columns][:20],
-        "numeric_usable": usable_numeric_cols(df)[:10],
-        "categorical": categorical_cols(df)[:10],
-        "example_rows": df.head(2).to_dict(orient="records"),
-    }
-    system = (
-        "You are a helpful data analyst. Rewrite a technical recommendation list for a general audience. "
-        "Be clear and friendly, ~150–220 words. For each suggested analysis, say what question it answers "
-        "in plain language and when to use it. Include 1 short example prompt in quotes when helpful. "
-        "Avoid jargon; do not invent columns; prefer manipulable numeric columns over IDs."
-    )
-    user = f"Dataset (truncated JSON):\n{json.dumps(schema)}\n\nTechnical recommendations:\n{tech_text}"
-    global _last_llm_time
-    since = time.time() - _last_llm_time
-    if since < LLM_COOLDOWN_SEC:
-        time.sleep(LLM_COOLDOWN_SEC - since)
-    attempt = 0
-    while True:
-        try:
-            resp = client.chat.completions.create(
-                model=SPATCHAT_LLM_MODEL,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                temperature=0.3,
-            ).choices[0].message.content
-            _last_llm_time = time.time()
-            return resp.strip()
-        except Exception as e:
-            if "429" in str(e) and attempt < LLM_MAX_RETRIES:
-                attempt += 1
-                time.sleep(1.0 * attempt)
-                continue
-            return tech_text
-
-def humanize_result(kind: str, details: str) -> str:
-    canned = {
-        "t-test": "Compares the average of one numeric variable between two groups (e.g., males vs females). Useful when groups are independent; Welch’s version is robust to unequal variances.",
-        "ANOVA": "Tests whether at least one group mean differs when you have 3+ groups. Follow up with plots or pairwise comparisons to see where differences are.",
-        "OLS": "Fits a straight-line relationship between a numeric outcome and one or more predictors, showing how much the outcome changes per unit change in each predictor.",
-        "GLM": "A flexible regression that matches the type of outcome (e.g., yes/no with logistic, counts with Poisson) to get better estimates and valid uncertainty.",
-    }
-    if not (SPATCHAT_LLM_ENABLED and SPATCHAT_HUMANIZE_RESULTS):
-        return canned.get(kind, "")
-    client = _get_llm_client()
-    if client is None:
-        return canned.get(kind, "")
-    system = ("Write a 1–2 sentence, non-jargony explanation of why this analysis is appropriate and what it tells you. "
-              "Do NOT restate the numeric results; describe the purpose. Keep it under 45 words.")
-    user = f"Analysis kind: {kind}\nContext snapshot:\n{details}"
-    global _last_llm_time
-    since = time.time() - _last_llm_time
-    if since < LLM_COOLDOWN_SEC:
-        time.sleep(LLM_COOLDOWN_SEC - since)
-    attempt = 0
-    while True:
-        try:
-            resp = client.chat.completions.create(
-                model=SPATCHAT_LLM_MODEL,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                temperature=0.2,
-            ).choices[0].message.content
-            _last_llm_time = time.time()
-            return resp.strip()
-        except Exception as e:
-            if "429" in str(e) and attempt < LLM_MAX_RETRIES:
-                attempt += 1
-                time.sleep(1.0 * attempt)
-                continue
-            return canned.get(kind, "")
+    tech = "\n".join(overview_lines + [""] + rec_lines)
+    examples = "\n".join(ex_lines)
+    return tech, examples
 
 # ---------- ANALYSES ----------
 @dataclass
@@ -415,7 +308,7 @@ def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=
     a = df.loc[df[group] == g1, value].dropna().astype(float).values
     b = df.loc[df[group] == g2, value].dropna().astype(float).values
 
-    # Box
+    # Box (consistent order)
     fig_box, ax = plt.subplots(figsize=(5, 3))
     ax.boxplot([a, b], tick_labels=[str(g1), str(g2)])
     ax.set_title("Boxplot by Group")
@@ -428,7 +321,7 @@ def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=
     ax.set_title("Violin by Group")
     png_vio = fig_to_png(fig_vio)
 
-    # Bar ± SEM — consistent order
+    # Bar ± SEM
     dfg = pd.DataFrame({group: [g1] * len(a) + [g2] * len(b), value: np.concatenate([a, b])})
     stats_tbl = dfg.groupby(group, sort=False)[value].agg(['mean', 'std', 'count']).reset_index()
     labels = [str(g1), str(g2)]
@@ -569,6 +462,157 @@ def check_homogeneity(df: pd.DataFrame, value: str, group: str) -> str:
     stat, p = stats.levene(*arrays)
     return f"Levene test for equal variances: W={stat:.4f}, p={p:.4g}"
 
+# ---------- DESCRIPTIVES ----------
+def format_table_for_chat(df: pd.DataFrame, max_rows: int = 30) -> str:
+    if len(df) > max_rows:
+        df = df.head(max_rows)
+    # Avoid dependency on tabulate; use plain text
+    return df.to_string(index=False)
+
+def run_desc(df: pd.DataFrame, op: str, col: Optional[str], group: Optional[str]) -> ModelOutput:
+    op = op.lower()
+    # Summary of dataset or a single column
+    if op in {"summary", "describe"}:
+        if col and col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                s = df[col].dropna().astype(float)
+                res = pd.DataFrame({
+                    "count": [len(s)],
+                    "mean": [s.mean()],
+                    "sd": [s.std(ddof=1)],
+                    "min": [s.min()],
+                    "25%": [np.percentile(s,25)],
+                    "50% (median)": [np.percentile(s,50)],
+                    "75%": [np.percentile(s,75)],
+                    "max": [s.max()],
+                })
+                text = f"Summary of `{col}`:\n\n" + format_table_for_chat(res)
+                return ModelOutput("Summary", text)
+            else:
+                vc = df[col].astype(str).value_counts(dropna=True).reset_index()
+                vc.columns = [col, "count"]
+                text = f"Frequencies for `{col}`:\n\n" + format_table_for_chat(vc)
+                return ModelOutput("Summary", text)
+        else:
+            nums = usable_numeric_cols(df)
+            if nums:
+                desc = df[nums].describe().T.reset_index().rename(columns={"index":"column"})
+                text = "Summary of numeric columns:\n\n" + format_table_for_chat(desc)
+            else:
+                text = "No numeric columns found for summary."
+            return ModelOutput("Summary", text)
+
+    # Single metric (optionally by group)
+    if not col or col not in df.columns:
+        raise gr.Error("Please specify a valid column for this descriptive request.")
+
+    if group and group in df.columns:
+        if op in {"mean","average","avg"}:
+            out = df.groupby(group)[col].mean(numeric_only=True).reset_index(name="mean")
+            txt = f"Mean of `{col}` by `{group}`:\n\n" + format_table_for_chat(out)
+            return ModelOutput("Descriptives", txt)
+        if op in {"median"}:
+            out = df.groupby(group)[col].median(numeric_only=True).reset_index(name="median")
+            txt = f"Median of `{col}` by `{group}`:\n\n" + format_table_for_chat(out)
+            return ModelOutput("Descriptives", txt)
+        if op in {"sd","stdev","std","standard deviation"}:
+            out = df.groupby(group)[col].std(ddof=1, numeric_only=True).reset_index(name="sd")
+            txt = f"Standard deviation of `{col}` by `{group}`:\n\n" + format_table_for_chat(out)
+            return ModelOutput("Descriptives", txt)
+        if op in {"min"}:
+            out = df.groupby(group)[col].min(numeric_only=True).reset_index(name="min")
+            txt = f"Minimum of `{col}` by `{group}`:\n\n" + format_table_for_chat(out)
+            return ModelOutput("Descriptives", txt)
+        if op in {"max"}:
+            out = df.groupby(group)[col].max(numeric_only=True).reset_index(name="max")
+            txt = f"Maximum of `{col}` by `{group}`:\n\n" + format_table_for_chat(out)
+            return ModelOutput("Descriptives", txt)
+        if op in {"range"}:
+            tmp = df.groupby(group)[col].agg(["min","max"]).reset_index()
+            tmp["range"] = tmp["max"] - tmp["min"]
+            txt = f"Range of `{col}` by `{group}`:\n\n" + format_table_for_chat(tmp[[group,"min","max","range"]])
+            return ModelOutput("Descriptives", txt)
+        if op in {"mode","modes"}:
+            # compute per group top mode
+            parts = []
+            for g, gdf in df.groupby(group):
+                s = gdf[col].dropna()
+                m = s.mode()
+                if m.empty:
+                    parts.append({"group": g, "mode": None, "count": 0})
+                else:
+                    top = m.iloc[0]
+                    parts.append({"group": g, "mode": top, "count": (s==top).sum()})
+            out = pd.DataFrame(parts)
+            txt = f"Mode of `{col}` by `{group}`:\n\n" + format_table_for_chat(out)
+            return ModelOutput("Descriptives", txt)
+        if op in {"freq","frequency","frequencies"}:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                # bin numeric into 10 bins per group
+                parts = []
+                for g, gdf in df.groupby(group):
+                    s = gdf[col].dropna().astype(float)
+                    if len(s)==0:
+                        continue
+                    bins = np.histogram_bin_edges(s, bins="auto")
+                    counts, edges = np.histogram(s, bins=bins)
+                    for i, cnt in enumerate(counts):
+                        parts.append({"group":g, "bin":[edges[i], edges[i+1]], "count":int(cnt)})
+                out = pd.DataFrame(parts)
+            else:
+                out = df.groupby([group, col]).size().reset_index(name="count")
+            txt = f"Frequencies of `{col}` by `{group}`:\n\n" + format_table_for_chat(out)
+            return ModelOutput("Descriptives", txt)
+    else:
+        # No grouping
+        if op in {"mean","average","avg"}:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            txt = f"Mean of `{col}` = {s.mean():.4g} (n={len(s)})"
+            return ModelOutput("Descriptives", txt)
+        if op in {"median"}:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            txt = f"Median of `{col}` = {np.median(s):.4g} (n={len(s)})"
+            return ModelOutput("Descriptives", txt)
+        if op in {"sd","stdev","std","standard deviation"}:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            txt = f"Standard deviation of `{col}` = {s.std(ddof=1):.4g} (n={len(s)})"
+            return ModelOutput("Descriptives", txt)
+        if op in {"min"}:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            txt = f"Minimum of `{col}` = {s.min():.4g}"
+            return ModelOutput("Descriptives", txt)
+        if op in {"max"}:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            txt = f"Maximum of `{col}` = {s.max():.4g}"
+            return ModelOutput("Descriptives", txt)
+        if op in {"range"}:
+            s = pd.to_numeric(df[col], errors="coerce").dropna()
+            txt = f"Range of `{col}` = {s.max()-s.min():.4g} (min={s.min():.4g}, max={s.max():.4g})"
+            return ModelOutput("Descriptives", txt)
+        if op in {"mode","modes"}:
+            s = df[col].dropna()
+            m = s.mode()
+            if m.empty:
+                txt = f"No mode for `{col}`."
+            else:
+                top = m.iloc[0]
+                txt = f"Mode of `{col}` = {top} (count={(s==top).sum()})"
+            return ModelOutput("Descriptives", txt)
+        if op in {"freq","frequency","frequencies"}:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                s = df[col].dropna().astype(float)
+                bins = np.histogram_bin_edges(s, bins="auto")
+                counts, edges = np.histogram(s, bins=bins)
+                out = pd.DataFrame({"bin_start":edges[:-1], "bin_end":edges[1:], "count":counts})
+                txt = f"Frequencies (binned) for `{col}`:\n\n" + format_table_for_chat(out)
+            else:
+                out = df[col].astype(str).value_counts(dropna=True).reset_index()
+                out.columns = [col, "count"]
+                txt = f"Frequencies for `{col}`:\n\n" + format_table_for_chat(out)
+            return ModelOutput("Descriptives", txt)
+
+    raise gr.Error("I didn't recognize that descriptive request. Try: 'What's the average height?' or 'Median score by sex'.")
+
 # ---------- FILE/ZIP ----------
 def write_report(sections: List[Tuple[str, str, Optional[bytes]]]) -> str:
     parts = ["<h1>SpatChat – Stats Report</h1>"]
@@ -604,11 +648,11 @@ def clear_outputs():
 def ask_llm(chat_history, user_input):
     if not SPATCHAT_LLM_ENABLED:
         return None, ("LLM disabled. Use explicit commands like "
-                      "`ttest value=height group=sex` or enable SPATCHAT_LLM_ENABLED=1.")
+                      "`ttest value=height group=sex` or ask natural questions like `What is the average height?`.")
     client = _get_llm_client()
     if client is None:
-        return None, ("TOGETHER_API_KEY not set. You can still run explicit commands, e.g. "
-                      "`ttest value=score group=sex`, `anova value=height group=site`.")
+        return None, ("TOGETHER_API_KEY not set. You can still run explicit commands (e.g. "
+                      "`ttest value=score group=sex`) and natural queries like `mean height by sex`.")
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history + [{"role": "user", "content": user_input}]
     global _last_llm_time
     since = time.time() - _last_llm_time
@@ -650,82 +694,99 @@ def _find_first_col_mention(text: str, df: pd.DataFrame) -> Optional[str]:
         return cols_lower[t.lower()]
     return None
 
+def _extract_by_group(text: str) -> Optional[str]:
+    m = re.search(r"\bby\s+([A-Za-z_][A-Za-z0-9_]*)", text, re.I)
+    return m.group(1) if m else None
+
 def parse_explicit(user_message: str) -> Optional[Tuple[str, dict]]:
     s = user_message.lower()
-    grp_hint = None
-    m = re.search(r"\bby\s+([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
-    if m: grp_hint = m.group(1)
 
     # Recommend
     if re.search(r"\b(what can i do|how (should|to) (i )?analy[sz]e|what (analys(e|es)|tests?) should i do|recommend(ation)?s|help analy[sz]e|suggest (analy|tests?))\b", s):
         return ("recommend", {})
 
-    # Histogram
+    # -------- Descriptive stats (highest priority so they don't fall into OLS) --------
+    # mean / average
+    if re.search(r"\b(mean|average|avg)\b", s):
+        col = _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
+        group = _extract_by_group(user_message)
+        return ("desc", {"op": "mean", "col": col, "group": group})
+    # median
+    if re.search(r"\bmedian\b", s):
+        col = _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
+        group = _extract_by_group(user_message)
+        return ("desc", {"op": "median", "col": col, "group": group})
+    # sd / stdev / standard deviation
+    if re.search(r"\b(sd|stdev|std|standard\s+deviation)\b", s):
+        col = _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
+        group = _extract_by_group(user_message)
+        return ("desc", {"op": "sd", "col": col, "group": group})
+    # min / max / range
+    if re.search(r"\bmin(imum)?\b", s):
+        col = _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
+        group = _extract_by_group(user_message)
+        return ("desc", {"op": "min", "col": col, "group": group})
+    if re.search(r"\bmax(imum)?\b", s):
+        col = _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
+        group = _extract_by_group(user_message)
+        return ("desc", {"op": "max", "col": col, "group": group})
+    if re.search(r"\brange\b", s):
+        col = _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
+        group = _extract_by_group(user_message)
+        return ("desc", {"op": "range", "col": col, "group": group})
+    # mode
+    if re.search(r"\bmode(s)?\b", s) and not re.search(r"\bmodel\b", s):
+        col = _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
+        group = _extract_by_group(user_message)
+        return ("desc", {"op": "mode", "col": col, "group": group})
+    # freq / distribution
+    if re.search(r"\b(freq(uenc(y|ies))?|distribution)\b", s) or re.search(r"\bcount(s)?\s+by\b", s):
+        col = _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
+        group = _extract_by_group(user_message)
+        return ("desc", {"op": "freq", "col": col, "group": group})
+    # summary / describe
+    if re.search(r"\b(summary|describe|descriptive statistics|basic stats)\b", s):
+        col = _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
+        return ("desc", {"op": "summary", "col": col, "group": None})
+
+    # -------- Plots --------
     if re.search(r"\bhist(?:ogram)?\b", s):
         m = re.search(r"(?:col(?:umn)?|of|on|for)\s*=?\s*([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
-        col = m.group(1) if m else None
+        col = m.group(1) if m else _find_first_col_mention(user_message, cached_df) if cached_df is not None else None
         bins_m = re.search(r"bins\s*=\s*(\d+)", s)
         bins = int(bins_m.group(1)) if bins_m else 30
         return ("plot", {"hist": {"col": col, "bins": bins}})
-
-    # Box & Violin
     if re.search(r"\bbox(?:plot)?\b", s):
-        v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
-        g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
-        if not v:
-            v = re.search(r"(?:box(?:plot)?\s+(?:of|on|for)\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
-        if not g:
-            g = re.search(r"(?:by\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
-        return ("plot", {"box": {"value": v and v.group(1), "group": g.group(1) if g else grp_hint}})
-
+        v = re.search(r"(?:box(?:plot)?\s+(?:of|on|for)\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        g = re.search(r"(?:by\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        return ("plot", {"box": {"value": (v and v.group(1)) or _find_first_col_mention(user_message, cached_df), "group": g and g.group(1)}})
     if re.search(r"\bviolin\b", s):
-        v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
-        g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
-        if not v:
-            v = re.search(r"(?:violin\s+(?:of|on|for)\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
-        if not g:
-            g = re.search(r"(?:by\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
-        return ("plot", {"violin": {"value": v and v.group(1), "group": g.group(1) if g else grp_hint}})
-
-    # Bar
+        v = re.search(r"(?:violin\s+(?:of|on|for)\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        g = re.search(r"(?:by\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        return ("plot", {"violin": {"value": (v and v.group(1)) or _find_first_col_mention(user_message, cached_df), "group": g and g.group(1)}})
     if re.search(r"\bbar\s*(plot|chart)?\b", s):
-        value = None; group = grp_hint; error = None
+        value = None; group = _extract_by_group(user_message); error = None
         m = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message);  value = m and m.group(1)
-        m = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message);  group = m.group(1) if m else (group if grp_hint else None)
+        m = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message);  group = m.group(1) if m else group
         m = re.search(r"error\s*=\s*(sem|sd|ci95)", s);               error = m and m.group(1)
-        # also support "bar of X by Y"
         if value is None:
             m = re.search(r"\bbar(?:\s*(?:plot|chart))?\s+(?:of|on|for)\s+([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
             value = m and m.group(1)
-        return ("plot", {"bar": {"value": value, "group": group, "error": error or "sem"}})
+        return ("plot", {"bar": {"value": value or _find_first_col_mention(user_message, cached_df), "group": group, "error": error or "sem"}})
 
-    # t-test
+    # -------- Inference tests/models --------
     if re.search(r"\bt[-\s]?test\b|\bttest\b", s):
-        v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
-        if not v:
-            v = re.search(r"(?:t[-\s]?test|ttest)\s+(?:of|on|for)\s+([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
-        g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
-        if not g and grp_hint:
-            g_val = grp_hint
-        else:
-            g_val = g and g.group(1)
-        return ("ttest", {"value": v and v.group(1), "group": g_val,
-                          "_explicit_value": bool(v), "_explicit_group": bool(g or grp_hint)})
-
-    # ANOVA
+        v = re.search(r"(?:t[-\s]?test|ttest)\s+(?:of|on|for)\s+([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        g = _extract_by_group(user_message)
+        return ("ttest", {"value": (v and v.group(1)) or _find_first_col_mention(user_message, cached_df), "group": g,
+                          "_explicit_value": bool(v), "_explicit_group": bool(g)})
     if re.search(r"\banova\b", s):
-        v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
-        if not v:
-            v = re.search(r"(?:anova)\s+(?:of|on|for)\s+([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
-        g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
-        if not g and grp_hint:
-            g_val = grp_hint
-        else:
-            g_val = g and g.group(1)
-        return ("anova", {"value": v and v.group(1), "group": g_val,
-                          "_explicit_value": bool(v), "_explicit_group": bool(g or grp_hint)})
+        v = re.search(r"(?:anova)\s+(?:of|on|for)\s+([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        g = _extract_by_group(user_message)
+        return ("anova", {"value": (v and v.group(1)) or _find_first_col_mention(user_message, cached_df), "group": g,
+                          "_explicit_value": bool(v), "_explicit_group": bool(g)})
 
-    # OLS / GLM plain text formulas are passed through by LLM or manual
+    # OLS/GLM left to LLM or explicit syntax (e.g., "ols y ~ x")
     return None
 
 # ---------- CLARIFICATION HELPERS ----------
@@ -792,7 +853,7 @@ def handle_upload(file):
         cols = ", ".join(df.columns.astype(str))
         preview = df.head(200)
         return (
-            [{"role": "assistant", "content": f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, hist/box/violin/bar, normality checks, power, or say **'what can I do with my data?'**"}],
+            [{"role": "assistant", "content": f"CSV uploaded. Columns detected: {cols}. Ask me for mean/median/sd, t-test, ANOVA, OLS/GLM, hist/box/violin/bar, normality, power — or say **'what can I do with my data?'**"}],
             gr.update(value=preview, visible=True),
             gr.update(visible=False),
             [], 0,
@@ -812,12 +873,12 @@ def handle_chat(chat_history, user_message, pending_state):
 
     df = cached_df.copy()
 
-    # --- Fresh command override: if this message is explicit, drop pending
+    # Fresh explicit command overrides any pending state
     explicit = parse_explicit(user_message)
     if explicit:
-        pending = {}  # reset any old state
+        pending = {}
 
-    # If not explicit and we had pending, continue that flow
+    # If no explicit and we had pending, continue that flow
     if not explicit and pending.get("action"):
         resolved, clarify_msg, new_pending = resolve_pending(pending, user_message, df)
         if clarify_msg:
@@ -833,12 +894,8 @@ def handle_chat(chat_history, user_message, pending_state):
     tool = None; llm_output = None
     if not explicit:
         tool, llm_output = ask_llm(chat_history, user_message)
-        if tool and isinstance(tool, dict):
-            if tool.get("tool") == "stats":
-                # already normalized
-                pass
 
-    # --- Decide action/args
+    # Decide action
     if explicit:
         action = explicit[0]; args = explicit[1]; tool_ok = True
     elif tool and tool.get("tool") == "stats":
@@ -846,19 +903,30 @@ def handle_chat(chat_history, user_message, pending_state):
     else:
         tool_ok = False
 
-    # --- Execute
     if tool_ok:
         sections: List[Tuple[str, str, Optional[bytes]]] = []
         plot_filepaths: List[str] = []
         preview_path: Optional[str] = None
 
         try:
-            if action == "ttest":
+            if action == "desc":
+                op = args.get("op")
+                col = args.get("col")
+                group = args.get("group")
+                # Auto-pick sensible defaults when missing
+                if op in {"mean","median","sd","stdev","std","standard deviation","min","max","range","mode","freq","frequency","frequencies"} and (not col or col not in df.columns):
+                    nums = usable_numeric_cols(df)
+                    col = nums[0] if nums else numeric_cols(df)[0] if numeric_cols(df) else None
+                out = run_desc(df, op, col, group)
+                sections.append((out.kind, out.summary_text, None))
+                new_pending = {}
+
+            elif action == "ttest":
                 group = args.get("group")
                 value = args.get("value")
                 explicit_value = bool(args.get("_explicit_value", False))
 
-                # Validate group: needs exactly 2 levels
+                # Group must be 2 levels
                 if not group or group not in df.columns or df[group].nunique(dropna=True) != 2:
                     bins = [c for c in categorical_cols(df) if df[c].nunique(dropna=True) == 2]
                     if not bins:
@@ -881,7 +949,7 @@ def handle_chat(chat_history, user_message, pending_state):
                         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0, {"action":"ttest","await":"ttest_value","group":group}
                     if len(candidates) > 1 and not value:
                         opts = ", ".join(candidates[:12]) + ("…" if len(candidates)>12 else "")
-                        msg = f"Which numeric outcome should I test? Candidates: {opts}\nExample: `ttest value={candidates[0]} group={group}`"
+                        msg = f"Which numeric outcome should I test? Candidates: {opts}\nExample: `I want a t-test on {candidates[0]} by {group}`"
                         chat_history.extend([{"role":"user","content":user_message},{"role":"assistant","content":msg}])
                         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0, {"action":"ttest","await":"ttest_value","group":group}
                     value = candidates[0] if not value else value
@@ -925,7 +993,7 @@ def handle_chat(chat_history, user_message, pending_state):
                         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0, {"action":"anova","await":"anova_value","group":group}
                     if len(nums) > 1 and not value:
                         opts = ", ".join(nums[:12]) + ("…" if len(nums)>12 else "")
-                        msg = f"Which numeric outcome for ANOVA? Candidates: {opts}\nExample: `anova value={nums[0]} group={group}`"
+                        msg = f"Which numeric outcome for ANOVA? Candidates: {opts}\nExample: `Run ANOVA of {nums[0]} by {group}`"
                         chat_history.extend([{"role":"user","content":user_message},{"role":"assistant","content":msg}])
                         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0, {"action":"anova","await":"anova_value","group":group}
                     value = nums[0] if not value else value
@@ -939,9 +1007,7 @@ def handle_chat(chat_history, user_message, pending_state):
                 new_pending = {}
 
             elif action == "ols":
-                out = smf.ols(args.get("formula"), data=df).fit()
-                coef = out.summary2().tables[1].reset_index().rename(columns={"index":"term"})
-                # simple visuals
+                model = smf.ols(args.get("formula"), data=df).fit()
                 lhs, rhs = [s.strip() for s in args.get("formula").split("~", 1)]
                 terms = [t.strip() for t in re.split(r"\+|:|\*", rhs) if t.strip()]
                 fig_fit: Optional[bytes] = None
@@ -949,18 +1015,18 @@ def handle_chat(chat_history, user_message, pending_state):
                     x = df[terms[0]]; y = df[lhs]; fig, ax = plt.subplots(figsize=(5,3))
                     ax.scatter(x, y)
                     order = np.argsort(x.values)
-                    ax.plot(x.values[order], out.fittedvalues.values[order])
+                    ax.plot(x.values[order], model.fittedvalues.values[order])
                     ax.set_xlabel(terms[0]); ax.set_ylabel(lhs); ax.set_title("Scatter + OLS fit")
                     fig_fit = fig_to_png(fig)
                 fig_r, ax = plt.subplots(figsize=(5,3))
-                ax.scatter(out.fittedvalues, out.resid); ax.axhline(0, linestyle=":")
+                ax.scatter(model.fittedvalues, model.resid); ax.axhline(0, linestyle=":")
                 ax.set_xlabel("Fitted"); ax.set_ylabel("Residuals"); ax.set_title("Residuals vs Fitted")
                 png_r = fig_to_png(fig_r)
-                sm.qqplot(out.resid, line="45", fit=True)
+                sm.qqplot(model.resid, line="45", fit=True)
                 png_qq = fig_to_png(plt.gcf())
-                header = (f"OLS Regression\nn = {int(out.nobs)}, df_model = {out.df_model:.0f}, df_resid = {out.df_resid:.0f}\n"
-                          f"R² = {out.rsquared:.4g}, adj. R² = {out.rsquared_adj:.4g}\nF = {out.fvalue:.4g}, p(F) = {out.f_pvalue:.4g}")
-                sections.append(("OLS", header + "\n\n" + str(out.summary()), None))
+                header = (f"OLS Regression\nn = {int(model.nobs)}, df_model = {model.df_model:.0f}, df_resid = {model.df_resid:.0f}\n"
+                          f"R² = {model.rsquared:.4g}, adj. R² = {model.rsquared_adj:.4g}\nF = {model.fvalue:.4g}, p(F) = {model.f_pvalue:.4g}")
+                sections.append(("OLS", header + "\n\n" + str(model.summary()), None))
                 for title, png in [("Scatter+Fit", fig_fit), ("Residuals", png_r), ("QQ", png_qq)]:
                     if png:
                         fp = save_png(png, f"plot_{title.replace(' ','_').lower()}.png")
@@ -971,18 +1037,17 @@ def handle_chat(chat_history, user_message, pending_state):
                 fam_map = {"gaussian": sm.families.Gaussian(), "binomial": sm.families.Binomial(),
                            "poisson": sm.families.Poisson(), "gamma": sm.families.Gamma()}
                 fam = fam_map.get(args.get("family", "gaussian"), sm.families.Gaussian())
-                out = smf.glm(args.get("formula"), data=df, family=fam).fit()
-                coef = out.summary2().tables[1].reset_index().rename(columns={"index":"term"})
+                model = smf.glm(args.get("formula"), data=df, family=fam).fit()
                 fig_r, ax = plt.subplots(figsize=(5,3))
-                ax.scatter(out.fittedvalues, out.resid_deviance); ax.axhline(0, linestyle=":")
+                ax.scatter(model.fittedvalues, model.resid_deviance); ax.axhline(0, linestyle=":")
                 ax.set_xlabel("Fitted"); ax.set_ylabel("Residuals"); ax.set_title("Residuals vs Fitted (GLM)")
                 png_r = fig_to_png(fig_r)
-                sm.qqplot(out.resid_deviance, line="45", fit=True)
+                sm.qqplot(model.resid_deviance, line="45", fit=True)
                 png_qq = fig_to_png(plt.gcf())
                 header = (f"GLM ({args.get('family','gaussian')})\n"
-                          f"n = {int(out.nobs)}, df_model = {out.df_model:.0f}, df_resid = {out.df_resid:.0f}\n"
-                          f"AIC = {out.aic:.4g}, BIC = {out.bic:.4g}")
-                sections.append((f"GLM ({args.get('family','gaussian')})", header + "\n\n" + str(out.summary()), None))
+                          f"n = {int(model.nobs)}, df_model = {model.df_model:.0f}, df_resid = {model.df_resid:.0f}\n"
+                          f"AIC = {model.aic:.4g}, BIC = {model.bic:.4g}")
+                sections.append((f"GLM ({args.get('family','gaussian')})", header + "\n\n" + str(model.summary()), None))
                 for title, png in [("Residuals", png_r), ("QQ", png_qq)]:
                     if png:
                         fp = save_png(png, f"plot_{title.replace(' ','_').lower()}.png")
@@ -1044,30 +1109,30 @@ def handle_chat(chat_history, user_message, pending_state):
             elif action == "power":
                 if "ttest_ind" in args:
                     p = args["ttest_ind"]
-                    msg = TTestIndPower().solve_power(
-                        effect_size=p.get("effect_size"),
-                        power=p.get("power"),
-                        alpha=float(p.get("alpha", 0.05)),
-                        ratio=float(p.get("ratio", 1.0)),
-                        alternative="two-sided"
-                    )
-                    sections.append(("Power – t-test (ind)", f"Required total sample size ≈ {int(np.ceil((1+float(p.get('ratio',1.0)))*msg))}", None))
+                    tool = TTestIndPower()
+                    ratio = float(p.get("ratio", 1.0))
+                    es = p.get("effect_size", 0.5)
+                    pw = p.get("power", 0.8)
+                    alpha = float(p.get("alpha", 0.05))
+                    n1 = tool.solve_power(effect_size=es, power=pw, alpha=alpha, ratio=ratio, alternative="two-sided")
+                    total = int(np.ceil((1+ratio)*n1))
+                    msg = f"Required total sample size (two-sample t-test): ≈ {total} (group1 ≈ {int(np.ceil(n1))}, group2 ≈ {int(np.ceil(n1*ratio))})"
+                    sections.append(("Power – t-test (ind)", msg, None))
                 if "anova_oneway" in args:
                     p = args["anova_oneway"]
-                    n = FTestAnovaPower().solve_power(
-                        effect_size=p.get("effect_size"),
-                        k_groups=int(p.get("k_groups", 3)),
-                        alpha=float(p.get("alpha", 0.05)),
-                        power=p.get("power")
-                    )
-                    sections.append(("Power – ANOVA (one-way)", f"Required n per group ≈ {int(np.ceil(n))}", None))
+                    tool = FTestAnovaPower()
+                    es = p.get("effect_size", 0.25)
+                    k = int(p.get("k_groups", 3))
+                    pw = p.get("power", 0.8)
+                    alpha = float(p.get("alpha", 0.05))
+                    n = tool.solve_power(effect_size=es, k_groups=k, alpha=alpha, power=pw)
+                    msg = f"Required n per group (one-way ANOVA): ≈ {int(np.ceil(n))}"
+                    sections.append(("Power – ANOVA (one-way)", msg, None))
                 new_pending = {}
 
             elif action == "recommend":
-                tech = recommend_analyses_text(df)
-                friendly = humanize_recommendations(tech, df)
-                examples = recommend_examples_natural(df)
-                sections.append(("Recommendations", friendly, None))
+                tech, examples = recommend_text_and_examples(df)
+                sections.append(("Recommendations", tech, None))
                 sections.append(("Say it like this", examples, None))
                 new_pending = {}
 
@@ -1079,22 +1144,22 @@ def handle_chat(chat_history, user_message, pending_state):
             sections.append(("Error", str(e), None))
             new_pending = {}
 
-        chat_summary = "\n\n".join([f"## {title}\n{txt}" for (title, txt, _) in sections if txt])
+        chat_body = "\n\n".join([f"## {title}\n{txt}" for (title, txt, _) in sections if txt])
         _ = write_report(sections)
         zip_fp = save_zip()
         chat_history.append({"role": "user", "content": user_message})
-        chat_history.append({"role": "assistant", "content": chat_summary or "Done. See preview and use Download Results."})
+        chat_history.append({"role": "assistant", "content": chat_body or "Done. See preview and use Download Results."})
         if not plot_filepaths:
             return chat_history, gr.update(value=None), gr.update(value=zip_fp, visible=True), [], 0, new_pending
         return chat_history, gr.update(value=preview_path), gr.update(value=zip_fp, visible=True), plot_filepaths, len(plot_filepaths) - 1, new_pending
 
-    # Not a tool call → natural reply
+    # Not a tool call → natural fallback
     if llm_output:
         chat_history.append({"role": "user", "content": user_message})
         chat_history.append({"role": "assistant", "content": llm_output})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0, pending
     else:
-        chat_history.append({"role": "assistant", "content": "Try: `ttest value=height group=sex` (auto Bar±SEM, Box, Violin), `anova value=score group=treatment`, `ols score ~ weight`, `plot hist col=height`, or ask **“what can I do with my data?”**"})
+        chat_history.append({"role": "assistant", "content": "Try: “What is the average height?”, “t-test on score by sex”, “Run ANOVA of height by group”, “plot histogram of weight”, or ask **“what can I do with my data?”**"})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0, pending
 
 # ---------- PLOT NAV ----------
@@ -1155,9 +1220,9 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 label="SpatChat",
                 show_label=True,
                 type="messages",
-                value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test (auto Bar±SEM, Box, Violin), ANOVA, OLS/GLM, hist/box/violin/bar, normality, power — or say **“what can I do with my data?”**"}]
+                value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: mean/median/sd, t-test (auto Bar±SEM, Box, Violin), ANOVA, OLS/GLM, histogram/box/violin/bar, normality, power — or say **“what can I do with my data?”**"}]
             )
-            user_input = gr.Textbox(label="Ask SpatChat", placeholder='e.g., "I want a t-test on height by sex" | "plot histogram of height" | "ols score ~ weight"', lines=1)
+            user_input = gr.Textbox(label="Ask SpatChat", placeholder='e.g., "What is the average height?" | "t-test on score by sex" | "plot histogram of weight" | "ols score ~ weight"', lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
             with gr.Row():
