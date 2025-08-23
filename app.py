@@ -39,6 +39,8 @@ SPATCHAT_LLM_ENABLED = os.getenv("SPATCHAT_LLM_ENABLED", "1") == "1"
 SPATCHAT_LLM_MODEL = os.getenv("SPATCHAT_LLM_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free")
 LLM_COOLDOWN_SEC = float(os.getenv("SPATCHAT_LLM_COOLDOWN_SEC", "2.0"))
 LLM_MAX_RETRIES = int(os.getenv("SPATCHAT_LLM_MAX_RETRIES", "2"))
+SPATCHAT_HUMANIZE_RECS = os.getenv("SPATCHAT_HUMANIZE_RECS", "1") == "1"
+SPATCHAT_HUMANIZE_RESULTS = os.getenv("SPATCHAT_HUMANIZE_RESULTS", "1") == "1"
 
 _llm_client = None
 _last_llm_time = 0.0
@@ -205,6 +207,99 @@ def recommend_analyses_text(df: pd.DataFrame) -> str:
     lines.append("\nRecommended next steps:\n" + "\n".join(recs))
     return "\n".join(lines)
 
+# ---------- LLM HUMANIZERS ----------
+def humanize_recommendations(tech_text: str, df: pd.DataFrame) -> str:
+    if not (SPATCHAT_LLM_ENABLED and SPATCHAT_HUMANIZE_RECS):
+        return tech_text
+    client = _get_llm_client()
+    if client is None:
+        return tech_text
+
+    schema = {
+        "rows": int(len(df)),
+        "columns": [str(c) for c in df.columns][:20],
+        "numeric": numeric_cols(df)[:10],
+        "categorical": categorical_cols(df)[:10],
+        "example_rows": df.head(2).to_dict(orient="records"),
+    }
+
+    system = (
+        "You are a helpful data analyst. Rewrite a technical recommendation list for a general audience. "
+        "Be clear and friendly, ~150–220 words. For each suggested analysis, say what question it answers "
+        "in plain language and when to use it. Include 1 short example command in backticks when helpful. "
+        "Avoid jargon; do not invent columns; if unsure, say 'for example'. Bullet points are fine."
+    )
+    user = f"Dataset (truncated JSON):\n{json.dumps(schema)}\n\nTechnical recommendations:\n{tech_text}"
+
+    global _last_llm_time
+    since = time.time() - _last_llm_time
+    if since < LLM_COOLDOWN_SEC:
+        time.sleep(LLM_COOLDOWN_SEC - since)
+
+    attempt = 0
+    while True:
+        try:
+            resp = client.chat.completions.create(
+                model=SPATCHAT_LLM_MODEL,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user}],
+                temperature=0.3,
+            ).choices[0].message.content
+            _last_llm_time = time.time()
+            return resp.strip()
+        except Exception as e:
+            msg = str(getattr(e, "message", e))
+            if "429" in msg and attempt < LLM_MAX_RETRIES:
+                attempt += 1
+                time.sleep(1.0 * attempt)
+                continue
+            return tech_text
+
+def humanize_result(kind: str, details: str) -> str:
+    """
+    Produce a short, friendly 'Why this?' explanation (1–2 sentences).
+    Falls back to canned text when LLM is unavailable.
+    """
+    canned = {
+        "t-test": "Compares the average of one numeric variable between two groups (e.g., males vs females). Useful when groups are independent; Welch’s version is robust to unequal variances.",
+        "ANOVA": "Tests whether at least one group mean differs when you have 3+ groups. Follow up with plots or pairwise comparisons to see where differences are.",
+        "OLS": "Fits a straight-line relationship between a numeric outcome and one or more predictors, showing how much the outcome changes per unit change in each predictor.",
+        "GLM": "A flexible regression that matches the type of outcome (e.g., yes/no with logistic, counts with Poisson) to get better estimates and valid uncertainty.",
+    }
+    if not (SPATCHAT_LLM_ENABLED and SPATCHAT_HUMANIZE_RESULTS):
+        return canned.get(kind, "")
+    client = _get_llm_client()
+    if client is None:
+        return canned.get(kind, "")
+
+    system = ("Write a 1–2 sentence, non-jargony explanation of why this analysis is appropriate and what it tells you. "
+              "Do NOT restate the numeric results; describe the purpose. Keep it under 45 words.")
+    user = f"Analysis kind: {kind}\nContext snapshot:\n{details}"
+
+    global _last_llm_time
+    since = time.time() - _last_llm_time
+    if since < LLM_COOLDOWN_SEC:
+        time.sleep(LLM_COOLDOWN_SEC - since)
+
+    attempt = 0
+    while True:
+        try:
+            resp = client.chat.completions.create(
+                model=SPATCHAT_LLM_MODEL,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user}],
+                temperature=0.2,
+            ).choices[0].message.content
+            _last_llm_time = time.time()
+            return resp.strip()
+        except Exception as e:
+            msg = str(getattr(e, "message", e))
+            if "429" in msg and attempt < LLM_MAX_RETRIES:
+                attempt += 1
+                time.sleep(1.0 * attempt)
+                continue
+            return canned.get(kind, "")
+
 # ---------- ANALYSES & SUMMARIES ----------
 @dataclass
 class ModelOutput:
@@ -300,7 +395,9 @@ def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=
         "sd": [a.std(ddof=1), b.std(ddof=1)]
     })
     summary = _ttest_summary(a, b, paired=paired, equal_var=equal_var, g1=str(g1), g2=str(g2))
-    return ModelOutput("t-test", summary, table, [("Bar±SEM", png_bar), ("Boxplot", png_box), ("Violin", png_vio)])
+    why = humanize_result("t-test", f"value={value}, group={group}, g1={g1}, g2={g2}; {summary[:300]}")
+    summary_full = summary + ("\n\nWhy this: " + why if why else "")
+    return ModelOutput("t-test", summary_full, table, [("Bar±SEM", png_bar), ("Boxplot", png_box), ("Violin", png_vio)])
 
 def run_anova(df: pd.DataFrame, value: str, group: str) -> ModelOutput:
     order_raw = list(pd.unique(df[group].dropna()))
@@ -337,7 +434,9 @@ def run_anova(df: pd.DataFrame, value: str, group: str) -> ModelOutput:
         f"F({df1}, {df2}) = {F:.4g}, p = {p:.4g}, η² = {eta2:.4g}\n"
         f"Group means (n): " + ", ".join([f"{lab}={m:.4g} (n={n})" for lab, m, n in zip(labels, means, ns)])
     )
-    return ModelOutput("ANOVA", summary, means_table, [("Boxplot", png_box), ("Violin", png_vio)])
+    why = humanize_result("ANOVA", f"value={value}, group={group}, groups={labels}; {summary[:300]}")
+    summary_full = summary + ("\n\nWhy this: " + why if why else "")
+    return ModelOutput("ANOVA", summary_full, means_table, [("Boxplot", png_box), ("Violin", png_vio)])
 
 def run_ols(df: pd.DataFrame, formula: str) -> ModelOutput:
     model = smf.ols(formula, data=df).fit()
@@ -360,7 +459,9 @@ def run_ols(df: pd.DataFrame, formula: str) -> ModelOutput:
     png_qq = fig_to_png(plt.gcf())
     summary = (f"OLS Regression\nn = {int(model.nobs)}, df_model = {model.df_model:.0f}, df_resid = {model.df_resid:.0f}\n"
                f"R² = {model.rsquared:.4g}, adj. R² = {model.rsquared_adj:.4g}\nF = {model.fvalue:.4g}, p(F) = {model.f_pvalue:.4g}")
-    return ModelOutput("OLS", summary + "\n\n" + str(model.summary()), coef, [("Scatter+Fit", fig_fit), ("Residuals", png_r), ("QQ", png_qq)])
+    why = humanize_result("OLS", f"formula={formula}; {summary[:300]}")
+    summary_full = summary + ("\n\nWhy this: " + why if why else "")
+    return ModelOutput("OLS", summary_full + "\n\n" + str(model.summary()), coef, [("Scatter+Fit", fig_fit), ("Residuals", png_r), ("QQ", png_qq)])
 
 def run_glm(df: pd.DataFrame, formula: str, family: str) -> ModelOutput:
     fam_map = {"gaussian": sm.families.Gaussian(), "binomial": sm.families.Binomial(),
@@ -376,7 +477,9 @@ def run_glm(df: pd.DataFrame, formula: str, family: str) -> ModelOutput:
     png_qq = fig_to_png(plt.gcf())
     summary = (f"GLM ({family})\nn = {int(model.nobs)}, df_model = {model.df_model:.0f}, df_resid = {model.df_resid:.0f}\n"
                f"AIC = {model.aic:.4g}, BIC = {model.bic:.4g}")
-    return ModelOutput(f"GLM ({family})", summary + "\n\n" + str(model.summary()), coef, [("Residuals", png_r), ("QQ", png_qq)])
+    why = humanize_result("GLM", f"formula={formula}, family={family}; {summary[:300]}")
+    summary_full = summary + ("\n\nWhy this: " + why if why else "")
+    return ModelOutput(f"GLM ({family})", summary_full + "\n\n" + str(model.summary()), coef, [("Residuals", png_r), ("QQ", png_qq)])
 
 # ---------- PLOTS & CHECKS ----------
 def plot_hist(df: pd.DataFrame, col: str, bins: int = 30) -> Tuple[str, bytes]:
@@ -557,7 +660,6 @@ def parse_explicit(user_message: str) -> Optional[Tuple[str, dict]]:
 
     # Histogram
     if re.search(r"\bhist(?:ogram)?\b", s):
-        # col from "col=height" or "histogram of/on/for height"
         m = re.search(r"(?:col(?:umn)?|of|on|for)\s*=?\s*([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
         col = m.group(1) if m else None
         bins_m = re.search(r"bins\s*=\s*(\d+)", s)
@@ -912,8 +1014,10 @@ def handle_chat(chat_history, user_message, pending_state):
                 new_pending = {}
 
             elif action == "recommend":
-                text = recommend_analyses_text(df)
-                sections.append(("Recommendations", text, None))
+                tech = recommend_analyses_text(df)
+                friendly = humanize_recommendations(tech, df)
+                sections.append(("Recommendations", friendly, None))
+                sections.append(("Commands you can try", tech, None))
                 new_pending = {}
 
             else:
