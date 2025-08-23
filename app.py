@@ -6,7 +6,7 @@ import zipfile
 import shutil
 import base64
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -105,15 +105,18 @@ def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=
     else:
         stat, p = stats.ttest_ind(a, b, equal_var=equal_var, nan_policy="omit")
         test_name = "Welch t-test" if not equal_var else "Student t-test"
-    # Box & Violin
-    fig_box, ax = plt.subplots(figsize=(5,3))
+
+    # Boxplot
+    fig_box, ax = plt.subplots(figsize=(5, 3))
     ax.boxplot([a, b], labels=[str(gvals[0]), str(gvals[1])])
     ax.set_title("Boxplot by Group")
     png_box = fig_to_png(fig_box)
 
-    fig_vio, ax = plt.subplots(figsize=(5,3))
+    # Violin
+    fig_vio, ax = plt.subplots(figsize=(5, 3))
     ax.violinplot([a, b], showmeans=True)
-    ax.set_xticks([1,2]); ax.set_xticklabels([str(gvals[0]), str[gvals[1]) if False else str(gvals[1])])  # safe label rendering
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels([str(gvals[0]), str(gvals[1])])
     ax.set_title("Violin by Group")
     png_vio = fig_to_png(fig_vio)
 
@@ -132,16 +135,18 @@ def run_anova(df: pd.DataFrame, value: str, group: str) -> ModelOutput:
     if len(groups) < 2:
         raise gr.Error("ANOVA requires at least two groups.")
     F, p = stats.f_oneway(*groups)
-    # Box
-    fig_box, ax = plt.subplots(figsize=(5,3))
+
+    # Boxplot
+    fig_box, ax = plt.subplots(figsize=(5, 3))
     df.boxplot(column=value, by=group, ax=ax)
     ax.set_title("Boxplot by Group"); ax.figure.suptitle("")
     png_box = fig_to_png(fig_box)
+
     # Violin
-    fig_vio, ax = plt.subplots(figsize=(5,3))
+    fig_vio, ax = plt.subplots(figsize=(5, 3))
     data = [g[value].dropna().values for _, g in df[[group, value]].groupby(group)]
     ax.violinplot(data, showmeans=True)
-    ax.set_xticks(range(1, len(data)+1))
+    ax.set_xticks(range(1, len(data) + 1))
     ax.set_xticklabels([str(k) for k in df[group].dropna().unique().tolist()])
     ax.set_title("Violin by Group")
     png_vio = fig_to_png(fig_vio)
@@ -152,21 +157,23 @@ def run_anova(df: pd.DataFrame, value: str, group: str) -> ModelOutput:
 
 def run_ols(df: pd.DataFrame, formula: str) -> ModelOutput:
     model = smf.ols(formula, data=df).fit()
-    coef = model.summary2().tables[1].reset_index().rename(columns={"index":"term"})
-    # scatter+fit if single X numeric
-    lhs, rhs = [s.strip() for s in formula.split("~",1)]
+    coef = model.summary2().tables[1].reset_index().rename(columns={"index": "term"})
+
+    # Scatter + fit if single numeric predictor
+    lhs, rhs = [s.strip() for s in formula.split("~", 1)]
     terms = [t.strip() for t in re.split(r"\+|:|\*", rhs) if t.strip()]
     fig_fit: Optional[bytes] = None
     if len(terms) == 1 and terms[0] in df.columns and pd.api.types.is_numeric_dtype(df[terms[0]]):
         x = df[terms[0]]; y = df[lhs]
-        fig, ax = plt.subplots(figsize=(5,3))
+        fig, ax = plt.subplots(figsize=(5, 3))
         ax.scatter(x, y)
         order = np.argsort(x.values)
         ax.plot(x.values[order], model.fittedvalues.values[order])
         ax.set_xlabel(terms[0]); ax.set_ylabel(lhs); ax.set_title("Scatter + OLS fit")
         fig_fit = fig_to_png(fig)
+
     # residuals + QQ
-    fig_r, ax = plt.subplots(figsize=(5,3))
+    fig_r, ax = plt.subplots(figsize=(5, 3))
     ax.scatter(model.fittedvalues, model.resid)
     ax.axhline(0, linestyle=":")
     ax.set_xlabel("Fitted"); ax.set_ylabel("Residuals"); ax.set_title("Residuals vs Fitted")
@@ -187,9 +194,10 @@ def run_glm(df: pd.DataFrame, formula: str, family: str) -> ModelOutput:
     }
     fam = fam_map.get(family, sm.families.Gaussian())
     model = smf.glm(formula, data=df, family=fam).fit()
-    coef = model.summary2().tables[1].reset_index().rename(columns={"index":"term"})
+    coef = model.summary2().tables[1].reset_index().rename(columns={"index": "term"})
+
     # residuals + QQ (deviance)
-    fig_r, ax = plt.subplots(figsize=(5,3))
+    fig_r, ax = plt.subplots(figsize=(5, 3))
     ax.scatter(model.fittedvalues, model.resid_deviance)
     ax.axhline(0, linestyle=":")
     ax.set_xlabel("Fitted"); ax.set_ylabel("Residuals"); ax.set_title("Residuals vs Fitted (GLM)")
@@ -205,7 +213,7 @@ def run_glm(df: pd.DataFrame, formula: str, family: str) -> ModelOutput:
 
 def plot_hist(df: pd.DataFrame, col: str, bins: int = 30) -> Tuple[str, bytes]:
     series = df[col].dropna().astype(float)
-    fig, ax = plt.subplots(figsize=(5,3))
+    fig, ax = plt.subplots(figsize=(5, 3))
     ax.hist(series, bins=bins)
     ax.set_title(f"Histogram of {col}")
     png = fig_to_png(fig)
@@ -213,7 +221,7 @@ def plot_hist(df: pd.DataFrame, col: str, bins: int = 30) -> Tuple[str, bytes]:
 
 
 def plot_box(df: pd.DataFrame, value: str, group: str) -> Tuple[str, bytes]:
-    fig, ax = plt.subplots(figsize=(5,3))
+    fig, ax = plt.subplots(figsize=(5, 3))
     df.boxplot(column=value, by=group, ax=ax)
     ax.set_title(f"Boxplot of {value} by {group}"); ax.figure.suptitle("")
     png = fig_to_png(fig)
@@ -221,10 +229,10 @@ def plot_box(df: pd.DataFrame, value: str, group: str) -> Tuple[str, bytes]:
 
 
 def plot_violin(df: pd.DataFrame, value: str, group: str) -> Tuple[str, bytes]:
-    fig, ax = plt.subplots(figsize=(5,3))
+    fig, ax = plt.subplots(figsize=(5, 3))
     data = [g[value].dropna().values for _, g in df[[group, value]].groupby(group)]
     ax.violinplot(data, showmeans=True)
-    ax.set_xticks(range(1, len(data)+1))
+    ax.set_xticks(range(1, len(data) + 1))
     ax.set_xticklabels([str(k) for k in df[group].dropna().unique().tolist()])
     ax.set_title(f"Violin of {value} by {group}")
     png = fig_to_png(fig)
@@ -316,7 +324,7 @@ def clear_outputs():
 # ---------- CHAT HANDLERS ----------
 
 def ask_llm(chat_history, user_input):
-    messages = [{"role":"system","content":SYSTEM_PROMPT}] + chat_history + [{"role":"user","content":user_input}]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history + [{"role": "user", "content": user_input}]
     resp = client.chat.completions.create(
         model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
         messages=messages,
@@ -328,7 +336,7 @@ def ask_llm(chat_history, user_input):
     except Exception:
         conv = client.chat.completions.create(
             model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
-            messages=[{"role":"system","content":FALLBACK_PROMPT}] + messages,
+            messages=[{"role": "system", "content": FALLBACK_PROMPT}] + messages,
             temperature=0.7
         ).choices[0].message.content
         return None, conv
@@ -341,9 +349,9 @@ def handle_upload(file):
         df = pd.read_csv(file)
         cached_df = df
         cols = ", ".join(df.columns.astype(str))
-        return [{"role":"assistant","content":f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, histograms, box/violin, normality checks, or power analysis."}], gr.update(visible=True)
+        return [{"role": "assistant", "content": f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, histograms, box/violin, normality checks, or power analysis."}], gr.update(visible=True)
     except Exception as e:
-        return [{"role":"assistant","content":f"Failed to read CSV: {e}"}], gr.update(visible=False)
+        return [{"role": "assistant", "content": f"Failed to read CSV: {e}"}], gr.update(visible=False)
 
 
 def handle_chat(chat_history, user_message):
@@ -354,7 +362,7 @@ def handle_chat(chat_history, user_message):
     if tool and tool.get("tool") == "stats":
         action = tool.get("action"); args = tool.get("args", {})
         if cached_df is None:
-            chat_history.append({"role":"assistant","content":"Please upload a CSV first."})
+            chat_history.append({"role": "assistant", "content": "Please upload a CSV first."})
             return chat_history, gr.update(value=None), gr.update(value=None, visible=False)
         df = cached_df.copy()
         sections: List[Tuple[str, str, Optional[bytes]]] = []
@@ -364,51 +372,67 @@ def handle_chat(chat_history, user_message):
             if action == "ttest":
                 out = run_ttest(df, value=args.get("value"), group=args.get("group"), paired=bool(args.get("paired", False)), equal_var=bool(args.get("equal_var", False)))
                 if out.table is not None:
-                    table_fp = os.path.join(outputs_dir, "ttest_table.csv"); out.table.to_csv(table_fp, index=False)
+                    out.table.to_csv(os.path.join(outputs_dir, "ttest_table.csv"), index=False)
                 for title, png in (out.plots or []):
-                    if png: images.append(png); save_png(png, f"plot_{title.replace(' ','_').lower()}.png")
+                    if png:
+                        images.append(png)
+                        save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
                 sections.append((out.kind, out.summary_text, None))
 
             elif action == "anova":
                 out = run_anova(df, value=args.get("value"), group=args.get("group"))
                 for title, png in (out.plots or []):
-                    if png: images.append(png); save_png(png, f"plot_{title.replace(' ','_').lower()}.png")
+                    if png:
+                        images.append(png)
+                        save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
                 sections.append((out.kind, out.summary_text, None))
 
             elif action == "ols":
                 out = run_ols(df, formula=args.get("formula"))
                 if out.table is not None:
-                    fp = os.path.join(outputs_dir, "ols_coef.csv"); out.table.to_csv(fp, index=False)
+                    out.table.to_csv(os.path.join(outputs_dir, "ols_coef.csv"), index=False)
                 for title, png in (out.plots or []):
-                    if png: images.append(png); save_png(png, f"plot_{title.replace(' ','_').lower()}.png")
+                    if png:
+                        images.append(png)
+                        save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
                 sections.append((out.kind, out.summary_text, None))
 
             elif action == "glm":
-                out = run_glm(df, formula=args.get("formula"), family=args.get("family","gaussian"))
+                out = run_glm(df, formula=args.get("formula"), family=args.get("family", "gaussian"))
                 if out.table is not None:
-                    fp = os.path.join(outputs_dir, "glm_coef.csv"); out.table.to_csv(fp, index=False)
+                    out.table.to_csv(os.path.join(outputs_dir, "glm_coef.csv"), index=False)
                 for title, png in (out.plots or []):
-                    if png: images.append(png); save_png(png, f"plot_{title.replace(' ','_').lower()}.png")
+                    if png:
+                        images.append(png)
+                        save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
                 sections.append((out.kind, out.summary_text, None))
 
             elif action == "plot":
                 if "hist" in args:
-                    p = args["hist"]; title, png = plot_hist(df, p.get("col"), int(p.get("bins",30)))
-                    if png: images.append(png); save_png(png, f"plot_hist_{p.get('col')}.png")
+                    p = args["hist"]; title, png = plot_hist(df, p.get("col"), int(p.get("bins", 30)))
+                    if png:
+                        images.append(png)
+                        save_png(png, f"plot_hist_{p.get('col')}.png")
                     sections.append((title, "", png))
                 if "box" in args:
                     p = args["box"]; title, png = plot_box(df, p.get("value"), p.get("group"))
-                    if png: images.append(png); save_png(png, f"plot_box_{p.get('value')}_{p.get('group')}.png")
+                    if png:
+                        images.append(png)
+                        save_png(png, f"plot_box_{p.get('value')}_{p.get('group')}.png")
                     sections.append((title, "", png))
                 if "violin" in args:
                     p = args["violin"]; title, png = plot_violin(df, p.get("value"), p.get("group"))
-                    if png: images.append(png); save_png(png, f"plot_violin_{p.get('value')}_{p.get('group')}.png")
+                    if png:
+                        images.append(png)
+                        save_png(png, f"plot_violin_{p.get('value')}_{p.get('group')}.png")
                     sections.append((title, "", png))
 
             elif action == "check":
                 if "normality" in args:
                     p = args["normality"]; msg, png = check_normality(df, p.get("col"))
-                    if png: images.append(png); save_png(png, f"plot_qq_{p.get('col')}.png")
+                    if png:
+                        images.append(png)
+                        save_png(png, f"plot_qq_{p.get('col')}.png")
                     sections.append(("Normality", msg, png))
                 if "homogeneity" in args:
                     p = args["homogeneity"]; msg = check_homogeneity(df, p.get("value"), p.get("group"))
@@ -417,11 +441,11 @@ def handle_chat(chat_history, user_message):
             elif action == "power":
                 if "ttest_ind" in args:
                     p = args["ttest_ind"]
-                    msg = power_ttest_ind(p.get("effect_size"), float(p.get("alpha",0.05)), p.get("power"), float(p.get("ratio",1.0)), p.get("solve_for","n_total"))
+                    msg = power_ttest_ind(p.get("effect_size"), float(p.get("alpha", 0.05)), p.get("power"), float(p.get("ratio", 1.0)), p.get("solve_for", "n_total"))
                     sections.append(("Power – t-test (ind)", msg, None))
                 if "anova_oneway" in args:
                     p = args["anova_oneway"]
-                    msg = power_anova_oneway(p.get("effect_size"), int(p.get("k_groups",3)), float(p.get("alpha",0.05)), p.get("power"), p.get("solve_for","n_per_group"))
+                    msg = power_anova_oneway(p.get("effect_size"), int(p.get("k_groups", 3)), float(p.get("alpha", 0.05)), p.get("power"), p.get("solve_for", "n_per_group"))
                     sections.append(("Power – ANOVA (one-way)", msg, None))
 
             else:
@@ -430,21 +454,21 @@ def handle_chat(chat_history, user_message):
             sections.append(("Error", str(e), None))
 
         # Build HTML report and ZIP
-        report_fp = write_report(sections)
+        _ = write_report(sections)
         zip_fp = save_zip()
-        chat_history.append({"role":"user","content":user_message})
-        chat_history.append({"role":"assistant","content":"Done. See preview and use Download Results."})
-        # Show the last image (if any) for quick preview
+        chat_history.append({"role": "user", "content": user_message})
+        chat_history.append({"role": "assistant", "content": "Done. See preview and use Download Results."})
+
         preview = images[-1] if images else None
         return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True)
 
     # Not a tool call → natural language reply
     if llm_output:
-        chat_history.append({"role":"user","content":user_message})
-        chat_history.append({"role":"assistant","content":llm_output})
+        chat_history.append({"role": "user", "content": user_message})
+        chat_history.append({"role": "assistant", "content": llm_output})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False)
     else:
-        chat_history.append({"role":"assistant","content":"How can I help? Upload a CSV and try: 'ttest value=mpg group=am', 'ols mpg ~ wt + hp', 'plot hist col=hp', or 'power ttest_ind effect_size=0.5 power=0.8'."})
+        chat_history.append({"role": "assistant", "content": "How can I help? Upload a CSV and try: 'ttest value=mpg group=am', 'ols mpg ~ wt + hp', 'plot hist col=hp', or 'power ttest_ind effect_size=0.5 power=0.8'."})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False)
 
 
@@ -489,7 +513,7 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 label="SpatChat",
                 show_label=True,
                 type="messages",
-                value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test, ANOVA, OLS/GLM, histogram, box/violin, normality, or power analysis."}]
+                value=[{"role": "assistant", "content": "Welcome! Upload a CSV, then ask: t-test, ANOVA, OLS/GLM, histogram, box/violin, normality, or power analysis."}]
             )
             user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., ols mpg ~ wt + hp", lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
