@@ -171,40 +171,104 @@ def recommend_analyses_text(df: pd.DataFrame) -> str:
     recs = []
     if bins and nums:
         g = bins[0]; y = next((c for c in nums if c != g), nums[0])
-        recs.append(f"• **t-test**: compare means of `{y}` across `{g}` (2 groups).\n  Try: `ttest value={y} group={g}`")
+        recs.append(f"• t-test: compare means of {y} across {g} (2 groups).\nTry: ttest value={y} group={g}")
     multi_group = [c for c in cats if df[c].nunique(dropna=True) >= 3]
     if multi_group and nums:
         g = multi_group[0]; y = next((c for c in nums if c != g), nums[0])
-        recs.append(f"• **One-way ANOVA**: `{y}` by `{g}` (≥3 groups).\n  Try: `anova value={y} group={g}`")
+        recs.append(f"• One-way ANOVA: {y} by {g} (≥3 groups).\nTry: anova value={y} group={g}")
     if len(nums) >= 2:
         y = nums[0]; x = nums[1]
-        recs.append(f"• **Regression (OLS)**: `{y}` with `{x}`.\n  Try: `ols {y} ~ {x}`")
+        recs.append(f"• Regression (OLS): {y} with {x}.\nTry: ols {y} ~ {x}")
     if y_bin and len(nums) >= 1:
         y = y_bin[0]
         x = nums[0] if nums[0] != y else (nums[1] if len(nums) > 1 else None)
         if x:
-            recs.append(f"• **Logistic GLM** for binary outcome `{y}`.\n  Try: `glm {y} ~ {x} family=binomial`")
+            recs.append(f"• Logistic GLM for binary {y}.\nTry: glm {y} ~ {x} family=binomial")
     if y_count and len(nums) >= 1:
         y = y_count[0]
         x = nums[0] if nums[0] != y else (nums[1] if len(nums) > 1 else None)
         if x:
-            recs.append(f"• **Poisson GLM** for counts `{y}`.\n  Try: `glm {y} ~ {x} family=poisson`")
+            recs.append(f"• Poisson GLM for counts {y}.\nTry: glm {y} ~ {x} family=poisson")
     if nums:
         y = nums[0]
-        recs.append(f"• **Normality check**: `check normality col={y}`; histogram: `plot hist col={y}`")
+        recs.append(f"• Normality check: check normality col={y}; histogram: plot hist col={y}")
     if cats and nums:
         y = nums[0]; g = cats[0] if cats[0] != y else (cats[1] if len(cats)>1 else cats[0])
-        recs.append(f"• **Group visuals**: `plot box value={y} group={g}` or `plot violin value={y} group={g}`")
+        recs.append(f"• Group visuals: plot box value={y} group={g} or plot violin value={y} group={g}")
     if bins and nums:
         y = nums[0]; g = bins[0]
-        recs.append(f"• **Bar ± error**: `plot bar value={y} group={g} error=sem|sd|ci95`")
+        recs.append(f"• Bar ± error: plot bar value={y} group={g} error=sem|sd|ci95")
     if bins and nums:
-        recs.append("• **Power (t-test)**: `power ttest_ind effect_size=0.5 power=0.8`")
+        recs.append("• Power (t-test): power ttest_ind effect_size=0.5 power=0.8")
     if multi_group:
-        recs.append("• **Power (ANOVA)**: `power anova_oneway effect_size=0.25 k_groups=3 power=0.8`")
+        recs.append("• Power (ANOVA): power anova_oneway effect_size=0.25 k_groups=3 power=0.8")
     if not recs:
         recs.append("• Tell me your goal (e.g., “compare two groups on height” or “predict price from features”).")
     lines.append("\nRecommended next steps:\n" + "\n".join(recs))
+    return "\n".join(lines)
+
+def recommend_examples_natural(df: pd.DataFrame) -> str:
+    """
+    Friendly, natural-language example prompts users can say.
+    """
+    info = infer_schema(df)
+    nums = info["numeric"]
+    cats = info["categorical"]
+    bins = info["binary_groups"]
+    y_bin = info["y_bin"]
+    y_count = info["y_count"]
+
+    lines = []
+    lines.append("Here are some things you can say:")
+
+    if bins and nums:
+        g = bins[0]
+        y = next((c for c in nums if c != g), nums[0])
+        lines.append(f'• "I want to do a t-test on {y} by {g}."')
+
+    multi_group = [c for c in cats if df[c].nunique(dropna=True) >= 3]
+    if multi_group and nums:
+        g = multi_group[0]
+        y = next((c for c in nums if c != g), nums[0])
+        lines.append(f'• "Run a one-way ANOVA of {y} by {g}."')
+
+    if len(nums) >= 2:
+        y = nums[0]; x = nums[1]
+        lines.append(f'• "Fit a linear regression: {y} ~ {x}."')
+
+    if y_bin and len(nums) >= 1:
+        y = y_bin[0]
+        x = nums[0] if nums[0] != y else (nums[1] if len(nums) > 1 else None)
+        if x:
+            lines.append(f'• "Do a logistic regression: {y} ~ {x}."')
+
+    if y_count and len(nums) >= 1:
+        y = y_count[0]
+        x = nums[0] if nums[0] != y else (nums[1] if len(nums) > 1 else None)
+        if x:
+            lines.append(f'• "Fit a Poisson regression for {y} using {x}."')
+
+    if nums:
+        y = nums[0]
+        lines.append(f'• "Check normality of {y} and show a histogram."')
+
+    if cats and nums:
+        y = nums[0]
+        g = cats[0] if cats[0] != y else (cats[1] if len(cats) > 1 else cats[0])
+        lines.append(f'• "Show box and violin plots for {y} by {g}."')
+
+    if bins and nums:
+        y = nums[0]; g = bins[0]
+        lines.append(f'• "Make a bar chart of {y} by {g} with 95% CI error bars."')
+
+    if bins and nums:
+        lines.append('• "Power analysis for a t-test with 80% power and effect size 0.5."')
+    if multi_group:
+        lines.append('• "Power analysis for a one-way ANOVA with 3 groups and 80% power."')
+
+    if len(lines) == 1:
+        lines.append('• "Suggest some analyses based on my columns."')
+
     return "\n".join(lines)
 
 # ---------- LLM HUMANIZERS ----------
@@ -256,10 +320,6 @@ def humanize_recommendations(tech_text: str, df: pd.DataFrame) -> str:
             return tech_text
 
 def humanize_result(kind: str, details: str) -> str:
-    """
-    Produce a short, friendly 'Why this?' explanation (1–2 sentences).
-    Falls back to canned text when LLM is unavailable.
-    """
     canned = {
         "t-test": "Compares the average of one numeric variable between two groups (e.g., males vs females). Useful when groups are independent; Welch’s version is robust to unequal variances.",
         "ANOVA": "Tests whether at least one group mean differs when you have 3+ groups. Follow up with plots or pairwise comparisons to see where differences are.",
@@ -622,24 +682,17 @@ def ask_llm(chat_history, user_input):
             return None, f"(LLM unavailable: {msg}) You can run explicit commands like `ttest value=height group=sex`."
 
 def normalize_tool_call(call):
-    """Make LLM JSON robust: accept {'tool':'plot','action':'hist',...} etc."""
     if not isinstance(call, dict):
         return None
     t = call.get("tool")
     a = call.get("action")
     args = call.get("args", {})
-
-    # Already our schema
     if t == "stats":
         return call
-
-    # Compact shapes → expand to our schema
     if t == "plot" and a in {"hist", "box", "violin", "bar"}:
         return {"tool": "stats", "action": "plot", "args": {a: args}}
     if t in {"ttest", "anova", "ols", "glm", "check", "power", "recommend"}:
         return {"tool": "stats", "action": t, "args": args}
-
-    # Sometimes the model omits 'tool'
     if t is None and a in {"ttest","anova","ols","glm","plot","check","power","recommend","hist","box","violin","bar"}:
         if a in {"hist","box","violin","bar"}:
             return {"tool":"stats","action":"plot","args":{a: args}}
@@ -648,25 +701,17 @@ def normalize_tool_call(call):
 
 def parse_explicit(user_message: str) -> Optional[Tuple[str, dict]]:
     s = user_message.lower()
-
-    # Recommendations
     if re.search(r"\b(what can i do|how (should|to) (i )?analy[sz]e|what (analys(e|es)|tests?) should i do|recommend(ation)?s|help analy[sz]e|suggest (analy|tests?))\b", s):
         return ("recommend", {})
-
-    # Group hint like "on/by <col>"
     grp_hint = None
     m = re.search(r"\b(on|by)\s+([A-Za-z_][A-Za-z0-9_]*)", s)
     if m: grp_hint = m.group(2)
-
-    # Histogram
     if re.search(r"\bhist(?:ogram)?\b", s):
         m = re.search(r"(?:col(?:umn)?|of|on|for)\s*=?\s*([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
         col = m.group(1) if m else None
         bins_m = re.search(r"bins\s*=\s*(\d+)", s)
         bins = int(bins_m.group(1)) if bins_m else 30
         return ("plot", {"hist": {"col": col, "bins": bins}})
-
-    # Box / Violin
     if re.search(r"\bbox(?:plot)?\b", s):
         v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
         g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
@@ -675,7 +720,6 @@ def parse_explicit(user_message: str) -> Optional[Tuple[str, dict]]:
         if not g:
             g = re.search(r"(?:by\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
         return ("plot", {"box": {"value": v.group(1) if v else None, "group": g.group(1) if g else grp_hint}})
-
     if re.search(r"\bviolin\b", s):
         v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
         g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
@@ -684,27 +728,20 @@ def parse_explicit(user_message: str) -> Optional[Tuple[str, dict]]:
         if not g:
             g = re.search(r"(?:by\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
         return ("plot", {"violin": {"value": v.group(1) if v else None, "group": g.group(1) if g else grp_hint}})
-
-    # Bar
     if re.search(r"\bbar\s*(plot|chart)?\b", s):
         value = None; group = grp_hint; error = None
         m = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message);  value = m.group(1) if m else None
         m = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message);  group = m.group(1) if m else (group if grp_hint else None)
         m = re.search(r"error\s*=\s*(sem|sd|ci95)", s);               error = m.group(1) if m else None
         return ("plot", {"bar": {"value": value, "group": group, "error": error or "sem"}})
-
-    # t-test
     if re.search(r"\bt[-\s]?test\b|\bttest\b", s):
         v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
         g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
         return ("ttest", {"value": v and v.group(1), "group": g.group(1) if g else (grp_hint if grp_hint else None)})
-
-    # anova
     if re.search(r"\banova\b", s):
         v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
         g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
         return ("anova", {"value": v and v.group(1), "group": g.group(1) if g else (grp_hint if grp_hint else None)})
-
     return None
 
 # ---------- CLARIFICATION HELPERS ----------
@@ -729,7 +766,6 @@ def resolve_pending(pending: Dict, user_message: str, df: pd.DataFrame) -> Tuple
     if v_match: value = v_match.group(1)
     if g_match: group = g_match.group(1)
 
-    # Histogram column pending
     if wait == "hist_col":
         col = _find_first_col_mention(user_message, df)
         if not col or col not in df.columns or not pd.api.types.is_numeric_dtype(df[col]):
@@ -785,9 +821,9 @@ def handle_upload(file):
         return (
             [{"role": "assistant", "content": f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, hist/box/violin/bar, normality checks, power, or say **'what can I do with my data?'**"}],
             gr.update(value=preview, visible=True),
-            gr.update(visible=False),   # download button hidden until results exist
-            [], 0,   # plots_state, plot_index
-            {}       # pending
+            gr.update(visible=False),
+            [], 0,
+            {}
         )
     except Exception as e:
         return [{"role": "assistant", "content": f"Failed to read CSV: {e}"}], gr.update(visible=False), gr.update(visible=False), [], 0, {}
@@ -803,7 +839,6 @@ def handle_chat(chat_history, user_message, pending_state):
 
     df = cached_df.copy()
 
-    # Resolve pending clarifications locally
     if pending.get("action"):
         resolved, clarify_msg, new_pending = resolve_pending(pending, user_message, df)
         if clarify_msg:
@@ -817,11 +852,9 @@ def handle_chat(chat_history, user_message, pending_state):
             explicit = None
         tool = None; llm_output = None
     else:
-        # Local explicit parser first
         explicit = parse_explicit(user_message)
         tool = None; llm_output = None
         if not explicit:
-            # LLM fallback
             tool, llm_output = ask_llm(chat_history, user_message)
             if tool:
                 tool = normalize_tool_call(tool)
@@ -843,7 +876,6 @@ def handle_chat(chat_history, user_message, pending_state):
                 group = args.get("group")
                 value = args.get("value")
 
-                # Validate / clarify GROUP
                 if not group or group not in df.columns or df[group].nunique(dropna=True) != 2:
                     bins = binary_group_columns(df)
                     if not bins:
@@ -857,7 +889,6 @@ def handle_chat(chat_history, user_message, pending_state):
                         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0, {"action":"ttest","await":"ttest_group","value":value}
                     group = bins[0] if not group else group
 
-                # Validate / clarify VALUE
                 candidates = [c for c in numeric_cols(df) if c != group]
                 if not value or value not in candidates:
                     if len(candidates) == 0:
@@ -887,7 +918,6 @@ def handle_chat(chat_history, user_message, pending_state):
                 group = args.get("group")
                 value = args.get("value")
 
-                # Validate / clarify GROUP (≥2 levels)
                 if not group or group not in df.columns or df[group].nunique(dropna=True) < 2:
                     cats = [c for c in categorical_cols(df) if df[c].nunique(dropna=True) >= 2]
                     if not cats:
@@ -945,7 +975,6 @@ def handle_chat(chat_history, user_message, pending_state):
                 new_pending = {}
 
             elif action == "plot":
-                # HIST (with local clarification)
                 if "hist" in args:
                     p = args["hist"]
                     col = p.get("col")
@@ -1016,8 +1045,11 @@ def handle_chat(chat_history, user_message, pending_state):
             elif action == "recommend":
                 tech = recommend_analyses_text(df)
                 friendly = humanize_recommendations(tech, df)
+                examples = recommend_examples_natural(df)
                 sections.append(("Recommendations", friendly, None))
-                sections.append(("Commands you can try", tech, None))
+                sections.append(("Say it like this", examples, None))
+                # Uncomment to keep exact syntax for advanced users:
+                # sections.append(("Exact command syntax (advanced)", tech, None))
                 new_pending = {}
 
             else:
@@ -1028,7 +1060,6 @@ def handle_chat(chat_history, user_message, pending_state):
             sections.append(("Error", str(e), None))
             new_pending = {}
 
-        # Build HTML report and ZIP
         chat_summary = "\n\n".join([f"## {title}\n{txt}" for (title, txt, _) in sections if txt])
         _ = write_report(sections)
         zip_fp = save_zip()
@@ -1038,7 +1069,6 @@ def handle_chat(chat_history, user_message, pending_state):
             return chat_history, gr.update(value=None), gr.update(value=zip_fp, visible=True), [], 0, new_pending
         return chat_history, gr.update(value=preview_path), gr.update(value=zip_fp, visible=True), plot_filepaths, len(plot_filepaths) - 1, new_pending
 
-    # No tool recognized → natural language (LLM text or hint)
     if llm_output:
         chat_history.append({"role": "user", "content": user_message})
         chat_history.append({"role": "assistant", "content": llm_output})
@@ -1107,7 +1137,7 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 type="messages",
                 value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test (auto Bar±SEM, Box, Violin), ANOVA, OLS/GLM, hist/box/violin/bar, normality, power — or say **“what can I do with my data?”**"}]
             )
-            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., ttest on sex  |  ttest value=height group=sex  |  plot hist col=height  |  ols score ~ weight", lines=1)
+            user_input = gr.Textbox(label="Ask SpatChat", placeholder='e.g., "I want a t-test on height by sex" | "plot histogram of height" | "ols score ~ weight"', lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
             with gr.Row():
