@@ -186,63 +186,100 @@ def _ttest_summary(a: np.ndarray, b: np.ndarray, paired: bool, equal_var: bool, 
             f"Effect size: Cohen's d = {d:.4g}, Hedges' g = {g:.4g}")
 
 def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=False) -> ModelOutput:
-    gvals = df[group].dropna().unique().tolist()
-    if len(gvals) != 2:
+    # preserve encounter order for groups
+    order_raw = list(pd.unique(df[group].dropna()))
+    if len(order_raw) < 2:
         raise gr.Error("t-test requires exactly two groups in the group column.")
-    a = df[df[group] == gvals[0]][value].dropna().astype(float).values
-    b = df[df[group] == gvals[1]][value].dropna().astype(float).values
-    # run test (primary numbers come from SciPy; summary adds CI/df/effect sizes)
+    g1, g2 = order_raw[0], order_raw[1]
+    a = df.loc[df[group] == g1, value].dropna().astype(float).values
+    b = df.loc[df[group] == g2, value].dropna().astype(float).values
+
     _ = stats.ttest_rel(a, b, nan_policy="omit") if paired else stats.ttest_ind(a, b, equal_var=equal_var, nan_policy="omit")
 
-    # --- Plots: Bar±SEM + Box + Violin (auto for t-test) ---
+    # --- Plots: Bar±SEM + Box + Violin (all in SAME order: [g1, g2]) ---
+
     # Box
     fig_box, ax = plt.subplots(figsize=(5, 3))
-    ax.boxplot([a, b], tick_labels=[str(gvals[0]), str(gvals[1])]); ax.set_title("Boxplot by Group")
+    ax.boxplot([a, b], tick_labels=[str(g1), str(g2)])
+    ax.set_title("Boxplot by Group")
     png_box = fig_to_png(fig_box)
+
     # Violin
     fig_vio, ax = plt.subplots(figsize=(5, 3))
-    ax.violinplot([a, b], showmeans=True); ax.set_xticks([1, 2]); ax.set_xticklabels([str(gvals[0]), str(gvals[1])]); ax.set_title("Violin by Group")
+    ax.violinplot([a, b], showmeans=True)
+    ax.set_xticks([1, 2]); ax.set_xticklabels([str(g1), str(g2)])
+    ax.set_title("Violin by Group")
     png_vio = fig_to_png(fig_vio)
-    # Bar ± SEM
-    dfg = pd.DataFrame({group: [gvals[0]] * len(a) + [gvals[1]] * len(b),
-                        value: np.concatenate([a, b])})
-    stats_tbl = dfg.groupby(group)[value].agg(['mean', 'std', 'count']).reset_index()
-    means = stats_tbl['mean'].values; sds = stats_tbl['std'].values; ns = stats_tbl['count'].values.astype(float)
-    sem = sds / np.sqrt(np.where(ns > 0, ns, np.nan)); sem = np.nan_to_num(sem, nan=0.0)
-    labels = stats_tbl[group].astype(str).tolist(); x = np.arange(len(labels))
+
+    # Bar ± SEM — force same order
+    dfg = pd.DataFrame({group: [g1] * len(a) + [g2] * len(b), value: np.concatenate([a, b])})
+    stats_tbl = dfg.groupby(group, sort=False)[value].agg(['mean', 'std', 'count']).reset_index()
+
+    labels = [str(g1), str(g2)]
+    stats_tbl[group] = stats_tbl[group].astype(str)
+    stats_tbl = stats_tbl.set_index(group).reindex(labels).reset_index()
+
+    means = stats_tbl['mean'].values
+    sds   = stats_tbl['std'].values
+    ns    = stats_tbl['count'].values.astype(float)
+    sem   = sds / np.sqrt(np.where(ns > 0, ns, np.nan))
+    sem   = np.nan_to_num(sem, nan=0.0)
+
+    x = np.arange(len(labels))
     fig_bar, ax = plt.subplots(figsize=(6, 4))
-    ax.bar(x, means, yerr=sem, capsize=6); ax.set_xticks(x); ax.set_xticklabels(labels)
-    ax.set_ylabel(f"Mean {value}"); ax.set_title(f"{value} by {group} (error: SEM)")
+    ax.bar(x, means, yerr=sem, capsize=6)
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylabel(f"Mean {value}")
+    ax.set_title(f"{value} by {group} (error: SEM)")
     png_bar = fig_to_png(fig_bar)
 
     table = pd.DataFrame({
-        "group": [str(gvals[0]), str(gvals[1])],
+        "group": labels,
         "n": [len(a), len(b)],
         "mean": [a.mean(), b.mean()],
         "sd": [a.std(ddof=1), b.std(ddof=1)]
     })
-    summary = _ttest_summary(a, b, paired=paired, equal_var=equal_var, g1=str(gvals[0]), g2=str(gvals[1]))
+
+    summary = _ttest_summary(a, b, paired=paired, equal_var=equal_var, g1=str(g1), g2=str(g2))
     return ModelOutput("t-test", summary, table, [("Bar±SEM", png_bar), ("Boxplot", png_box), ("Violin", png_vio)])
 
 def run_anova(df: pd.DataFrame, value: str, group: str) -> ModelOutput:
-    groups = [g[value].dropna().astype(float).values for _, g in df[[group, value]].dropna().groupby(group)]
-    labels = [str(k) for k in df[group].dropna().unique().tolist()]
-    if len(groups) < 2: raise gr.Error("ANOVA requires at least two groups.")
-    F, p = stats.f_oneway(*groups)
-    ns = [len(g) for g in groups]; means = [g.mean() for g in groups]
-    overall = np.concatenate(groups).mean()
-    SSB = sum(n*(m-overall)**2 for n,m in zip(ns,means)); SSW = sum(((g-m)**2).sum() for g,m in zip(groups,means)); SST = SSB+SSW
-    k = len(groups); N = sum(ns); df1, df2 = k-1, N-k; eta2 = SSB/SST if SST>0 else np.nan
-    # Box
-    fig_box, ax = plt.subplots(figsize=(5, 3)); df.boxplot(column=value, by=group, ax=ax)
-    ax.set_title("Boxplot by Group"); ax.figure.suptitle(""); png_box = fig_to_png(fig_box)
-    # Violin
-    fig_vio, ax = plt.subplots(figsize=(5, 3)); ax.violinplot(groups, showmeans=True)
-    ax.set_xticks(range(1,len(groups)+1)); ax.set_xticklabels(labels); ax.set_title("Violin by Group")
-    png_vio = fig_to_png(fig_vio)
+    # preserve encounter order for labels and groups
+    order_raw = list(pd.unique(df[group].dropna()))
+    labels = [str(x) for x in order_raw]
+    groups_arrays = [df.loc[df[group] == lvl, value].dropna().astype(float).values for lvl in order_raw]
+    if len(groups_arrays) < 2:
+        raise gr.Error("ANOVA requires at least two groups.")
+
+    F, p = stats.f_oneway(*groups_arrays)
+    ns = [len(g) for g in groups_arrays]
+    means = [g.mean() for g in groups_arrays]
+    overall = np.concatenate(groups_arrays).mean()
+    SSB = sum(n * (m - overall) ** 2 for n, m in zip(ns, means))
+    SSW = sum(((g - m) ** 2).sum() for g, m in zip(groups_arrays, means))
+    SST = SSB + SSW
+    k = len(groups_arrays); N = sum(ns)
+    df1, df2 = k - 1, N - k
+    eta2 = SSB / SST if SST > 0 else np.nan
+
+    # Box (manual, preserves order)
+    fig_box, ax = plt.subplots(figsize=(5, 3))
+    ax.boxplot(groups_arrays, tick_labels=labels)
+    ax.set_title("Boxplot by Group"); png_box = fig_to_png(fig_box)
+
+    # Violin (manual, preserves order)
+    fig_vio, ax = plt.subplots(figsize=(5, 3))
+    ax.violinplot(groups_arrays, showmeans=True)
+    ax.set_xticks(range(1, len(labels) + 1)); ax.set_xticklabels(labels)
+    ax.set_title("Violin by Group"); png_vio = fig_to_png(fig_vio)
+
     means_table = pd.DataFrame({"group": labels, "n": ns, f"mean_{value}": means})
-    summary = (f"One-way ANOVA\nGroups: {', '.join(labels)}\nF({df1}, {df2}) = {F:.4g}, p = {p:.4g}, η² = {eta2:.4g}\n" +
-               "Group means (n): " + ", ".join([f"{lab}={m:.4g} (n={n})" for lab,m,n in zip(labels,means,ns)]))
+    summary = (
+        f"One-way ANOVA\n"
+        f"Groups: {', '.join(labels)}\n"
+        f"F({df1}, {df2}) = {F:.4g}, p = {p:.4g}, η² = {eta2:.4g}\n"
+        f"Group means (n): " + ", ".join([f"{lab}={m:.4g} (n={n})" for lab, m, n in zip(labels, means, ns)])
+    )
     return ModelOutput("ANOVA", summary, means_table, [("Boxplot", png_box), ("Violin", png_vio)])
 
 def run_ols(df: pd.DataFrame, formula: str) -> ModelOutput:
@@ -283,33 +320,60 @@ def plot_hist(df: pd.DataFrame, col: str, bins: int = 30) -> Tuple[str, bytes]:
     ax.hist(series, bins=bins); ax.set_title(f"Histogram of {col}")
     return f"Histogram {col}", fig_to_png(fig)
 
-def plot_box(df: pd.DataFrame, value: str, group: str) -> Tuple[str, bytes]:
-    fig, ax = plt.subplots(figsize=(5,3)); df.boxplot(column=value, by=group, ax=ax)
-    ax.set_title(f"Boxplot of {value} by {group}"); ax.figure.suptitle("")
+def plot_box(df: pd.DataFrame, value: str, group: str, order: Optional[List[str]] = None) -> Tuple[str, bytes]:
+    # manual grouping preserves order
+    order_raw = list(pd.unique(df[group].dropna())) if order is None else order
+    arrays = [df.loc[df[group] == lvl, value].dropna().astype(float).values for lvl in order_raw]
+    labels = [str(x) for x in order_raw]
+    fig, ax = plt.subplots(figsize=(5,3))
+    ax.boxplot(arrays, tick_labels=labels)
+    ax.set_title(f"Boxplot of {value} by {group}")
     return f"Boxplot {value}~{group}", fig_to_png(fig)
 
-def plot_violin(df: pd.DataFrame, value: str, group: str) -> Tuple[str, bytes]:
+def plot_violin(df: pd.DataFrame, value: str, group: str, order: Optional[List[str]] = None) -> Tuple[str, bytes]:
+    order_raw = list(pd.unique(df[group].dropna())) if order is None else order
+    arrays = [df.loc[df[group] == lvl, value].dropna().astype(float).values for lvl in order_raw]
+    labels = [str(x) for x in order_raw]
     fig, ax = plt.subplots(figsize=(5,3))
-    data = [g[value].dropna().values for _, g in df[[group, value]].groupby(group)]
-    ax.violinplot(data, showmeans=True); ax.set_xticks(range(1,len(data)+1))
-    ax.set_xticklabels([str(k) for k in df[group].dropna().unique().tolist()]); ax.set_title(f"Violin of {value} by {group}")
+    ax.violinplot(arrays, showmeans=True)
+    ax.set_xticks(range(1, len(labels)+1)); ax.set_xticklabels(labels)
+    ax.set_title(f"Violin of {value} by {group}")
     return f"Violin {value}~{group}", fig_to_png(fig)
 
-def plot_bar_with_error(df: pd.DataFrame, value: str, group: str, error: str = "sem") -> Tuple[str, bytes]:
-    dfg = df[[group, value]].dropna(); dfg[value] = dfg[value].astype(float)
-    stats_tbl = dfg.groupby(group)[value].agg(['mean', 'std', 'count']).reset_index()
-    means = stats_tbl['mean'].values; sds = stats_tbl['std'].values; ns = stats_tbl['count'].values.astype(float)
+def plot_bar_with_error(df: pd.DataFrame, value: str, group: str, error: str = "sem", order: Optional[List[str]] = None) -> Tuple[str, bytes]:
+    """Bar chart of group means with error bars (sem/sd/ci95), preserving order."""
+    dfg = df[[group, value]].dropna()
+    dfg[value] = dfg[value].astype(float)
+
+    stats_tbl = dfg.groupby(group, sort=False)[value].agg(['mean', 'std', 'count']).reset_index()
+
+    if order is None:
+        order = [str(x) for x in pd.unique(dfg[group])]
+
+    stats_tbl[group] = stats_tbl[group].astype(str)
+    stats_tbl = stats_tbl.set_index(group).reindex(order).reset_index()
+
+    means = stats_tbl['mean'].values
+    sds   = stats_tbl['std'].values
+    ns    = stats_tbl['count'].values.astype(float)
+
     if error.lower() == "sd":
         yerr = sds; err_label = "SD"
     elif error.lower() == "ci95":
-        sem = sds / np.sqrt(np.where(ns>0, ns, np.nan)); tcrit = stats.t.ppf(0.975, np.maximum(ns-1, 1)); yerr = sem * tcrit; err_label = "95% CI"
+        sem = sds / np.sqrt(np.where(ns>0, ns, np.nan))
+        tcrit = stats.t.ppf(0.975, np.maximum(ns-1, 1))
+        yerr = sem * tcrit; err_label = "95% CI"
     else:
         yerr = sds / np.sqrt(np.where(ns>0, ns, np.nan)); err_label = "SEM"
+
     yerr = np.nan_to_num(yerr, nan=0.0, posinf=0.0, neginf=0.0)
-    labels = stats_tbl[group].astype(str).tolist(); x = np.arange(len(labels))
+    labels = order
+    x = np.arange(len(labels))
     fig, ax = plt.subplots(figsize=(6,4))
     ax.bar(x, means, yerr=yerr, capsize=6)
-    ax.set_xticks(x); ax.set_xticklabels(labels); ax.set_ylabel(f"Mean {value}"); ax.set_title(f"{value} by {group} (error: {err_label})")
+    ax.set_xticks(x); ax.set_xticklabels(labels)
+    ax.set_ylabel(f"Mean {value}")
+    ax.set_title(f"{value} by {group} (error: {err_label})")
     return f"Bar {value}~{group} ({err_label})", fig_to_png(fig)
 
 def check_normality(df: pd.DataFrame, col: str) -> Tuple[str, Optional[bytes]]:
@@ -320,7 +384,7 @@ def check_normality(df: pd.DataFrame, col: str) -> Tuple[str, Optional[bytes]]:
     return msg, png
 
 def check_homogeneity(df: pd.DataFrame, value: str, group: str) -> str:
-    arrays = [g[value].dropna().values for _, g in df[[group, value]].groupby(group)]
+    arrays = [g[value].dropna().values for _, g in df[[group, value]].groupby(group, sort=False)]
     stat, p = stats.levene(*arrays)
     return f"Levene test for equal variances: W={stat:.4f}, p={p:.4g}"
 
@@ -387,9 +451,8 @@ def handle_upload(file):
         cached_df = df
         cols = ", ".join(df.columns.astype(str))
         preview = df.head(200)
-        # Reset plot navigator state on new upload
         return (
-            [{"role": "assistant", "content": f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, histograms, box/violin, bar w/ error bars, normality checks, or power analysis."}],
+            [{"role": "assistant", "content": f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, hist/box/violin/bar, normality checks, or power analysis."}],
             gr.update(value=preview, visible=True),
             gr.update(visible=True),
             [], 0  # plots_state, plot_index
@@ -448,7 +511,6 @@ def handle_chat(chat_history, user_message):
                                 equal_var=bool(args.get("equal_var", False)))
                 if out.table is not None:
                     out.table.to_csv(os.path.join(outputs_dir, "ttest_table.csv"), index=False)
-                # Save and queue all plots (Bar±SEM first for convenience)
                 for title, png in (out.plots or []):
                     if png:
                         fp = save_png(png, f"plot_{title.replace(' ','_').replace('±','pm').lower()}.png")
@@ -492,26 +554,28 @@ def handle_chat(chat_history, user_message):
                         plot_filepaths.append(fp); preview_path = fp
                     sections.append((title, "", png))
                 if "box" in args:
-                    p = args["box"]; title, png = plot_box(df, p.get("value"), p.get("group"))
+                    p = args["box"]; 
+                    title, png = plot_box(df, p.get("value"), p.get("group"))
                     if png:
                         fp = save_png(png, f"plot_box_{p.get('value')}_{p.get('group')}.png")
                         plot_filepaths.append(fp); preview_path = fp
                     sections.append((title, "", png))
                 if "violin" in args:
-                    p = args["violin"]; title, png = plot_violin(df, p.get("value"), p.get("group"))
+                    p = args["violin"]; 
+                    title, png = plot_violin(df, p.get("value"), p.get("group"))
                     if png:
                         fp = save_png(png, f"plot_violin_{p.get('value')}_{p.get('group')}.png")
                         plot_filepaths.append(fp); preview_path = fp
                     sections.append((title, "", png))
                 if "bar" in args:
                     p = args["bar"]
-                    val, grp = guess_bar_args(df, p.get("value"), p.get("group"))
-                    err = p.get("error", "sem")
-                    title, png = plot_bar_with_error(df, val, grp, err)
+                    # infer order from data to keep consistency
+                    order = [str(x) for x in pd.unique(df[p.get("group")].dropna())] if p.get("group") in df.columns else None
+                    title, png = plot_bar_with_error(df, p.get("value"), p.get("group"), p.get("error", "sem"), order=order)
                     if png:
-                        fp = save_png(png, f"plot_bar_{val}_{grp}_{err}.png")
+                        fp = save_png(png, f"plot_bar_{p.get('value')}_{p.get('group')}_{p.get('error','sem')}.png")
                         plot_filepaths.append(fp); preview_path = fp
-                    sections.append((title, f"Bar chart of mean {val} by {grp} with {err.upper()} error bars.", png))
+                    sections.append((title, f"Bar chart of mean {p.get('value')} by {p.get('group')} with {(p.get('error','sem')).upper()} error bars.", png))
 
             elif action == "check":
                 if "normality" in args:
@@ -548,7 +612,6 @@ def handle_chat(chat_history, user_message):
         zip_fp = save_zip()
         chat_history.append({"role":"user","content":user_message})
         chat_history.append({"role":"assistant","content":chat_summary or "Done. See preview and use Download Results."})
-        # Initialize plot navigator state to this command's plots
         if not plot_filepaths:
             return chat_history, gr.update(value=None), gr.update(value=zip_fp, visible=True), [], 0
         return chat_history, gr.update(value=preview_path), gr.update(value=zip_fp, visible=True), plot_filepaths, len(plot_filepaths)-1
@@ -559,7 +622,7 @@ def handle_chat(chat_history, user_message):
         chat_history.append({"role":"assistant","content":llm_output})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0
     else:
-        chat_history.append({"role":"assistant","content":"Try: 'ttest value=score group=sex' (auto plots Bar±SEM, Box, Violin), or 'plot bar value=score group=sex error=ci95'."})
+        chat_history.append({"role":"assistant","content":"Try: 'ttest value=score group=sex' (auto Bar±SEM, Box, Violin), or 'plot bar value=score group=sex error=ci95'."})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0
 
 # ---------- PLOT NAVIGATION ----------
