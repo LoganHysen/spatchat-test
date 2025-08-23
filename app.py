@@ -673,7 +673,7 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
             preview_plot = gr.Image(label="Preview (last figure)", type="filepath")
-            data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, height=320, wrap=True)
+            data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, wrap=True)
             download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False)
 
     file_input.change(handle_upload, inputs=file_input, outputs=[chatbot, data_preview, download_btn])
