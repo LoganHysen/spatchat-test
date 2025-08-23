@@ -84,20 +84,11 @@ def add_to_report(parts: List[str], title: str, html_fragment: str):
     parts.append(f"<h2>{title}</h2>\n{html_fragment}")
 
 
-def df_to_html(df: pd.DataFrame) -> str:
-    return df.to_html(index=False, escape=False)
-
-
 def numeric_cols(df: pd.DataFrame) -> List[str]:
     return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
 
-def categorical_cols(df: pd.DataFrame) -> List[str]:
-    return [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
-
-
 def guess_ttest_args(df: pd.DataFrame, value: Optional[str], group: Optional[str]) -> Tuple[str, str]:
-    # Prefer provided; otherwise choose sensible defaults
     g = group
     if g is None:
         for cand in ["sex", "group", "am"]:
@@ -105,7 +96,6 @@ def guess_ttest_args(df: pd.DataFrame, value: Optional[str], group: Optional[str
                 g = cand
                 break
         if g is None:
-            # any categorical with exactly 2 unique values
             for cand in df.columns:
                 if len(df[cand].dropna().unique()) == 2:
                     g = cand
@@ -135,7 +125,6 @@ def guess_anova_args(df: pd.DataFrame, value: Optional[str], group: Optional[str
                 g = cand
                 break
         if g is None:
-            # any categorical with >=2 levels
             for cand in df.columns:
                 if len(df[cand].dropna().unique()) >= 2 and not pd.api.types.is_numeric_dtype(df[cand]):
                     g = cand
@@ -157,7 +146,7 @@ def guess_anova_args(df: pd.DataFrame, value: Optional[str], group: Optional[str
     return v, g
 
 
-# ---------- ANALYSES ----------
+# ---------- ANALYSES (with R-like summaries) ----------
 
 @dataclass
 class ModelOutput:
@@ -167,34 +156,89 @@ class ModelOutput:
     plots: Optional[List[Tuple[str, Optional[bytes]]]] = None
 
 
+def _ttest_summary(a: np.ndarray, b: np.ndarray, paired: bool, equal_var: bool, g1: str, g2: str) -> str:
+    alpha = 0.05
+    mean1, mean2 = a.mean(), b.mean()
+    n1, n2 = len(a), len(b)
+    var1, var2 = a.var(ddof=1), b.var(ddof=1)
+
+    if paired:
+        d = a - b
+        n = len(d); df = n - 1
+        md = d.mean()
+        sd = d.std(ddof=1)
+        se = sd / np.sqrt(n)
+        t = md / se
+        p = 2 * stats.t.sf(abs(t), df)
+        tcrit = stats.t.ppf(1 - alpha/2, df)
+        ci_low, ci_high = md - tcrit * se, md + tcrit * se
+        d_z = md / sd  # Cohen's dz
+        return (
+            f"Paired t-test\n"
+            f"Groups: {g1}, {g2}\n"
+            f"n = {n}\n"
+            f"Mean diff = {md:.4g}, 95% CI [{ci_low:.4g}, {ci_high:.4g}]\n"
+            f"t({df}) = {t:.4g}, p = {p:.4g}\n"
+            f"Effect size: Cohen's dz = {d_z:.4g}"
+        )
+
+    # independent samples
+    diff = mean1 - mean2
+    if equal_var:
+        df = n1 + n2 - 2
+        sp2 = ((n1 - 1) * var1 + (n2 - 1) * var2) / df
+        se = np.sqrt(sp2 * (1/n1 + 1/n2))
+        t = diff / se
+        p = 2 * stats.t.sf(abs(t), df)
+        tcrit = stats.t.ppf(1 - alpha/2, df)
+        ci_low, ci_high = diff - tcrit * se, diff + tcrit * se
+        d = diff / np.sqrt(sp2)
+    else:
+        se = np.sqrt(var1 / n1 + var2 / n2)
+        # Welch-Satterthwaite df
+        df = (var1/n1 + var2/n2)**2 / ((var1**2) / (n1**2 * (n1 - 1)) + (var2**2) / (n2**2 * (n2 - 1)))
+        t = diff / se
+        p = 2 * stats.t.sf(abs(t), df)
+        tcrit = stats.t.ppf(1 - alpha/2, df)
+        ci_low, ci_high = diff - tcrit * se, diff + tcrit * se
+        # Cohen's d using pooled SD as a common practice
+        sp2 = ((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2)
+        d = diff / np.sqrt(sp2)
+
+    # Hedges g small-sample correction
+    g = d * (1 - 3 / (4*(n1 + n2) - 9))
+
+    return (
+        f"{'Student' if equal_var else 'Welch'} t-test\n"
+        f"Groups: {g1} (n={n1}, mean={mean1:.4g}, sd={np.sqrt(var1):.4g}) vs "
+        f"{g2} (n={n2}, mean={mean2:.4g}, sd={np.sqrt(var2):.4g})\n"
+        f"Mean difference = {diff:.4g}, 95% CI [{ci_low:.4g}, {ci_high:.4g}]\n"
+        f"t({df:.2f}) = {t:.4g}, p = {p:.4g}\n"
+        f"Effect size: Cohen's d = {d:.4g}, Hedges' g = {g:.4g}"
+    )
+
+
 def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=False) -> ModelOutput:
     gvals = df[group].dropna().unique().tolist()
     if len(gvals) != 2:
         raise gr.Error("t-test requires exactly two groups in the group column.")
-    a = df[df[group] == gvals[0]][value].dropna()
-    b = df[df[group] == gvals[1]][value].dropna()
+    a = df[df[group] == gvals[0]][value].dropna().astype(float).values
+    b = df[df[group] == gvals[1]][value].dropna().astype(float).values
+    # Compute t/p primarily via SciPy for correctness; summary adds df/CI/effect size
     if paired:
-        if len(a) != len(b):
-            raise gr.Error("Paired t-test requires equal-length paired samples.")
         stat, p = stats.ttest_rel(a, b, nan_policy="omit")
-        test_name = "Paired t-test"
     else:
         stat, p = stats.ttest_ind(a, b, equal_var=equal_var, nan_policy="omit")
-        test_name = "Welch t-test" if not equal_var else "Student t-test"
 
-    # Boxplot (Matplotlib 3.9+: use tick_labels)
+    # Plots
     fig_box, ax = plt.subplots(figsize=(5, 3))
     ax.boxplot([a, b], tick_labels=[str(gvals[0]), str(gvals[1])])
-    ax.set_title("Boxplot by Group")
-    png_box = fig_to_png(fig_box)
+    ax.set_title("Boxplot by Group"); png_box = fig_to_png(fig_box)
 
-    # Violin
     fig_vio, ax = plt.subplots(figsize=(5, 3))
     ax.violinplot([a, b], showmeans=True)
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels([str(gvals[0]), str(gvals[1])])
-    ax.set_title("Violin by Group")
-    png_vio = fig_to_png(fig_vio)
+    ax.set_xticks([1, 2]); ax.set_xticklabels([str(gvals[0]), str(gvals[1])])
+    ax.set_title("Violin by Group"); png_vio = fig_to_png(fig_vio)
 
     table = pd.DataFrame({
         "group": [str(gvals[0]), str(gvals[1])],
@@ -202,33 +246,52 @@ def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=
         "mean": [a.mean(), b.mean()],
         "sd": [a.std(ddof=1), b.std(ddof=1)]
     })
-    txt = f"{test_name}: t={stat:.4f}, p={p:.4g}"
-    return ModelOutput("t-test", txt, table, [("Boxplot", png_box), ("Violin", png_vio)])
+
+    summary = _ttest_summary(a, b, paired=paired, equal_var=equal_var, g1=str(gvals[0]), g2=str(gvals[1]))
+    return ModelOutput("t-test", summary, table, [("Boxplot", png_box), ("Violin", png_vio)])
 
 
 def run_anova(df: pd.DataFrame, value: str, group: str) -> ModelOutput:
-    groups = [g[value].dropna().values for _, g in df[[group, value]].dropna().groupby(group)]
+    # Groups
+    groups = [g[value].dropna().astype(float).values for _, g in df[[group, value]].dropna().groupby(group)]
+    labels = [str(k) for k in df[group].dropna().unique().tolist()]
     if len(groups) < 2:
         raise gr.Error("ANOVA requires at least two groups.")
     F, p = stats.f_oneway(*groups)
 
-    # Boxplot
+    # df and effect size (eta-squared)
+    ns = [len(g) for g in groups]
+    means = [g.mean() for g in groups]
+    overall = np.concatenate(groups).mean()
+    SSB = sum(n * (m - overall) ** 2 for n, m in zip(ns, means))
+    SSW = sum(((g - m) ** 2).sum() for g, m in zip(groups, means))
+    SST = SSB + SSW
+    k = len(groups); N = sum(ns)
+    df1, df2 = k - 1, N - k
+    eta2 = SSB / SST if SST > 0 else np.nan
+
+    # Plots
     fig_box, ax = plt.subplots(figsize=(5, 3))
     df.boxplot(column=value, by=group, ax=ax)
     ax.set_title("Boxplot by Group"); ax.figure.suptitle("")
     png_box = fig_to_png(fig_box)
 
-    # Violin
     fig_vio, ax = plt.subplots(figsize=(5, 3))
-    data = [g[value].dropna().values for _, g in df[[group, value]].groupby(group)]
-    ax.violinplot(data, showmeans=True)
-    ax.set_xticks(range(1, len(data) + 1))
-    ax.set_xticklabels([str(k) for k in df[group].dropna().unique().tolist()])
+    ax.violinplot(groups, showmeans=True)
+    ax.set_xticks(range(1, len(groups) + 1))
+    ax.set_xticklabels(labels)
     ax.set_title("Violin by Group")
     png_vio = fig_to_png(fig_vio)
 
-    txt = f"One-way ANOVA: F={F:.4f}, p={p:.4g}"
-    return ModelOutput("ANOVA", txt, None, [("Boxplot", png_box), ("Violin", png_vio)])
+    means_table = pd.DataFrame({"group": labels, "n": ns, f"mean_{value}": means})
+    summary = (
+        f"One-way ANOVA\n"
+        f"Groups: {', '.join(labels)}\n"
+        f"F({df1}, {df2}) = {F:.4g}, p = {p:.4g}, η² = {eta2:.4g}\n"
+        f"Group means (n): " + ", ".join([f"{lab}={m:.4g} (n={n})" for lab, m, n in zip(labels, means, ns)])
+    )
+
+    return ModelOutput("ANOVA", summary, means_table, [("Boxplot", png_box), ("Violin", png_vio)])
 
 
 def run_ols(df: pd.DataFrame, formula: str) -> ModelOutput:
@@ -258,7 +321,15 @@ def run_ols(df: pd.DataFrame, formula: str) -> ModelOutput:
     sm.qqplot(model.resid, line="45", fit=True)
     png_qq = fig_to_png(plt.gcf())
 
-    return ModelOutput("OLS", str(model.summary()), coef, [("Scatter+Fit", fig_fit), ("Residuals", png_r), ("QQ", png_qq)])
+    summary = (
+        "OLS Regression\n"
+        f"n = {int(model.nobs)}, df_model = {model.df_model:.0f}, df_resid = {model.df_resid:.0f}\n"
+        f"R² = {model.rsquared:.4g}, adj. R² = {model.rsquared_adj:.4g}\n"
+        f"F = {model.fvalue:.4g}, p(F) = {model.f_pvalue:.4g}"
+    )
+
+    return ModelOutput("OLS", summary + "\n\n" + str(model.summary()), coef,
+                       [("Scatter+Fit", fig_fit), ("Residuals", png_r), ("QQ", png_qq)])
 
 
 def run_glm(df: pd.DataFrame, formula: str, family: str) -> ModelOutput:
@@ -282,10 +353,17 @@ def run_glm(df: pd.DataFrame, formula: str, family: str) -> ModelOutput:
     sm.qqplot(model.resid_deviance, line="45", fit=True)
     png_qq = fig_to_png(plt.gcf())
 
-    return ModelOutput(f"GLM ({family})", str(model.summary()), coef, [("Residuals", png_r), ("QQ", png_qq)])
+    summary = (
+        f"GLM ({family})\n"
+        f"n = {int(model.nobs)}, df_model = {model.df_model:.0f}, df_resid = {model.df_resid:.0f}\n"
+        f"AIC = {model.aic:.4g}, BIC = {model.bic:.4g}"
+    )
+
+    return ModelOutput(f"GLM ({family})", summary + "\n\n" + str(model.summary()), coef,
+                       [("Residuals", png_r), ("QQ", png_qq)])
 
 
-# ---------- PLOTS & CHECKS ----------
+# ---------- CHECKS & PLOTS ----------
 
 def plot_hist(df: pd.DataFrame, col: str, bins: int = 30) -> Tuple[str, bytes]:
     series = df[col].dropna().astype(float)
@@ -330,44 +408,12 @@ def check_homogeneity(df: pd.DataFrame, value: str, group: str) -> str:
     return f"Levene test for equal variances: W={stat:.4f}, p={p:.4g}"
 
 
-# ---------- POWER ----------
-
-def power_ttest_ind(effect_size: Optional[float], alpha: float, power: Optional[float], ratio: float, solve_for: str) -> str:
-    tool = TTestIndPower()
-    if solve_for == "n_total":
-        n = tool.solve_power(effect_size=effect_size, power=power, alpha=alpha, ratio=ratio, alternative="two-sided")
-        return f"Required total sample size (two-sample t-test): n_total ≈ {np.ceil((1+ratio)*n).astype(int)} (group1 ≈ {np.ceil(n).astype(int)}, group2 ≈ {np.ceil(n*ratio).astype(int)})"
-    elif solve_for == "power":
-        pw = tool.solve_power(effect_size=effect_size, nobs1=None, alpha=alpha, ratio=ratio, alternative="two-sided")
-        return f"Achieved power ≈ {pw:.3f}"
-    elif solve_for == "effect_size":
-        es = tool.solve_power(effect_size=None, nobs1=power, alpha=alpha, ratio=ratio, alternative="two-sided")
-        return f"Implied effect size d ≈ {es:.3f}"
-    else:
-        return "Unknown solve_for for t-test power."
-
-
-def power_anova_oneway(effect_size: Optional[float], k_groups: int, alpha: float, power: Optional[float], solve_for: str) -> str:
-    tool = FTestAnovaPower()
-    if solve_for == "n_per_group":
-        n = tool.solve_power(effect_size=effect_size, k_groups=k_groups, alpha=alpha, power=power)
-        return f"Required n per group (one-way ANOVA): ≈ {np.ceil(n).astype(int)}"
-    elif solve_for == "power":
-        pw = tool.solve_power(effect_size=effect_size, k_groups=k_groups, alpha=alpha, nobs=None)
-        return f"Achieved power ≈ {pw:.3f}"
-    elif solve_for == "effect_size":
-        es = tool.solve_power(effect_size=None, k_groups=k_groups, alpha=alpha, nobs=power)
-        return f"Implied effect size f ≈ {es:.3f}"
-    else:
-        return "Unknown solve_for for ANOVA power."
-
-
 # ---------- FILE/ZIP ----------
 
 def write_report(sections: List[Tuple[str, str, Optional[bytes]]]) -> str:
     parts = ["<h1>SpatChat – Stats Report</h1>"]
     for title, html_text, png in sections:
-        add_to_report(parts, title, f"<pre style='white-space:pre-wrap'>{html_text}</pre>")
+        parts.append(f"<h2>{title}</h2>\n<pre style='white-space:pre-wrap'>{html_text}</pre>")
         if png is not None:
             b64 = base64.b64encode(png).decode("ascii")
             parts.append(f"<img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto' />")
@@ -397,7 +443,7 @@ def clear_outputs():
     os.makedirs(outputs_dir, exist_ok=True)
 
 
-# ---------- CHAT HANDLERS ----------
+# ---------- LLM + CHAT HANDLERS ----------
 
 def _get_llm_client():
     global _llm_client
@@ -443,9 +489,15 @@ def handle_upload(file):
         df = pd.read_csv(file)
         cached_df = df
         cols = ", ".join(df.columns.astype(str))
-        return [{"role": "assistant", "content": f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, histograms, box/violin, normality checks, or power analysis."}], gr.update(visible=True)
+        # Show just the first 200 rows for performance; still scrollable
+        preview = df.head(200)
+        return (
+            [{"role": "assistant", "content": f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, histograms, box/violin, normality checks, or power analysis."}],
+            gr.update(value=preview, visible=True),
+            gr.update(visible=True)
+        )
     except Exception as e:
-        return [{"role": "assistant", "content": f"Failed to read CSV: {e}"}], gr.update(visible=False)
+        return [{"role": "assistant", "content": f"Failed to read CSV: {e}"}], gr.update(visible=False), gr.update(visible=False)
 
 
 def handle_chat(chat_history, user_message):
@@ -453,14 +505,14 @@ def handle_chat(chat_history, user_message):
     chat_history = list(chat_history)
     tool, llm_output = ask_llm(chat_history, user_message)
 
-    # Try to parse simple explicit commands if no tool JSON
+    # Simple explicit command parser fallback for ttest/anova
     explicit_tool = None
     if not tool:
         m = re.match(r"\s*(ttest|anova)\b", user_message.lower())
         if m:
             explicit_tool = m.group(1)
 
-    if tool and tool.get("tool") == "stats" or explicit_tool in {"ttest", "anova"}:
+    if (tool and tool.get("tool") == "stats") or (explicit_tool in {"ttest", "anova"}):
         action = (tool.get("action") if tool else explicit_tool)
         args = (tool.get("args", {}) if tool else {})
         if cached_df is None:
@@ -555,10 +607,13 @@ def handle_chat(chat_history, user_message):
         except Exception as e:
             sections.append(("Error", str(e), None))
 
+        # Build chat-friendly summary text (R-like outputs)
+        chat_summary = "\n\n".join([f"## {title}\n{txt}" for (title, txt, _) in sections if txt])
         _ = write_report(sections)
         zip_fp = save_zip()
+
         chat_history.append({"role": "user", "content": user_message})
-        chat_history.append({"role": "assistant", "content": "Done. See preview and use Download Results."})
+        chat_history.append({"role": "assistant", "content": chat_summary or "Done. See preview and use Download Results."})
         return chat_history, gr.update(value=preview_path), gr.update(value=zip_fp, visible=True)
 
     # Not a tool call → natural language reply
@@ -614,13 +669,14 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 type="messages",
                 value=[{"role": "assistant", "content": "Welcome! Upload a CSV, then ask: t-test, ANOVA, OLS/GLM, histogram, box/violin, normality, or power analysis."}]
             )
-            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., ols score ~ weight + height", lines=1)
+            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., ttest value=score group=sex  |  ols score ~ weight + height", lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
             preview_plot = gr.Image(label="Preview (last figure)", type="filepath")
+            data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, height=320, wrap=True)
             download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False)
 
-    file_input.change(handle_upload, inputs=file_input, outputs=[chatbot, download_btn])
+    file_input.change(handle_upload, inputs=file_input, outputs=[chatbot, data_preview, download_btn])
     user_input.submit(handle_chat, inputs=[chatbot, user_input], outputs=[chatbot, preview_plot, download_btn])
     user_input.submit(lambda *args: "", inputs=None, outputs=user_input)
 
