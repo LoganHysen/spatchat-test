@@ -274,7 +274,7 @@ def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=
     ax.set_title("Violin by Group")
     png_vio = fig_to_png(fig_vio)
 
-    # Bar ± SEM — force same order
+    # Bar ± SEM — consistent order
     dfg = pd.DataFrame({group: [g1] * len(a) + [g2] * len(b), value: np.concatenate([a, b])})
     stats_tbl = dfg.groupby(group, sort=False)[value].agg(['mean', 'std', 'count']).reset_index()
     labels = [str(g1), str(g2)]
@@ -518,33 +518,91 @@ def ask_llm(chat_history, user_input):
                 continue
             return None, f"(LLM unavailable: {msg}) You can run explicit commands like `ttest value=height group=sex`."
 
+def normalize_tool_call(call):
+    """Make LLM JSON robust: accept {'tool':'plot','action':'hist',...} etc."""
+    if not isinstance(call, dict):
+        return None
+    t = call.get("tool")
+    a = call.get("action")
+    args = call.get("args", {})
+
+    # Already our schema
+    if t == "stats":
+        return call
+
+    # Compact shapes → expand to our schema
+    if t == "plot" and a in {"hist", "box", "violin", "bar"}:
+        return {"tool": "stats", "action": "plot", "args": {a: args}}
+    if t in {"ttest", "anova", "ols", "glm", "check", "power", "recommend"}:
+        return {"tool": "stats", "action": t, "args": args}
+
+    # Sometimes the model omits 'tool'
+    if t is None and a in {"ttest","anova","ols","glm","plot","check","power","recommend","hist","box","violin","bar"}:
+        if a in {"hist","box","violin","bar"}:
+            return {"tool":"stats","action":"plot","args":{a: args}}
+        return {"tool":"stats","action":a,"args":args}
+    return call
+
 def parse_explicit(user_message: str) -> Optional[Tuple[str, dict]]:
     s = user_message.lower()
-    # Recommendations intent
+
+    # Recommendations
     if re.search(r"\b(what can i do|how (should|to) (i )?analy[sz]e|what (analys(e|es)|tests?) should i do|recommend(ation)?s|help analy[sz]e|suggest (analy|tests?))\b", s):
         return ("recommend", {})
-    # Extract "on/by <col>" as group hint
+
+    # Group hint like "on/by <col>"
     grp_hint = None
     m = re.search(r"\b(on|by)\s+([A-Za-z_][A-Za-z0-9_]*)", s)
-    if m:
-        grp_hint = m.group(2)
-    # bar
+    if m: grp_hint = m.group(2)
+
+    # Histogram
+    if re.search(r"\bhist(?:ogram)?\b", s):
+        # col from "col=height" or "histogram of/on/for height"
+        m = re.search(r"(?:col(?:umn)?|of|on|for)\s*=?\s*([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        col = m.group(1) if m else None
+        bins_m = re.search(r"bins\s*=\s*(\d+)", s)
+        bins = int(bins_m.group(1)) if bins_m else 30
+        return ("plot", {"hist": {"col": col, "bins": bins}})
+
+    # Box / Violin
+    if re.search(r"\bbox(?:plot)?\b", s):
+        v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
+        g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
+        if not v:
+            v = re.search(r"(?:box(?:plot)?\s+of\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        if not g:
+            g = re.search(r"(?:by\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        return ("plot", {"box": {"value": v.group(1) if v else None, "group": g.group(1) if g else grp_hint}})
+
+    if re.search(r"\bviolin\b", s):
+        v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
+        g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
+        if not v:
+            v = re.search(r"(?:violin\s+of\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        if not g:
+            g = re.search(r"(?:by\s+)([A-Za-z_][A-Za-z0-9_]*)", user_message, re.I)
+        return ("plot", {"violin": {"value": v.group(1) if v else None, "group": g.group(1) if g else grp_hint}})
+
+    # Bar
     if re.search(r"\bbar\s*(plot|chart)?\b", s):
         value = None; group = grp_hint; error = None
         m = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message);  value = m.group(1) if m else None
         m = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message);  group = m.group(1) if m else (group if grp_hint else None)
         m = re.search(r"error\s*=\s*(sem|sd|ci95)", s);               error = m.group(1) if m else None
         return ("plot", {"bar": {"value": value, "group": group, "error": error or "sem"}})
+
     # t-test
     if re.search(r"\bt[-\s]?test\b|\bttest\b", s):
         v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
         g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
         return ("ttest", {"value": v and v.group(1), "group": g.group(1) if g else (grp_hint if grp_hint else None)})
+
     # anova
     if re.search(r"\banova\b", s):
         v = re.search(r"value\s*=\s*([A-Za-z0-9_]+)", user_message)
         g = re.search(r"group\s*=\s*([A-Za-z0-9_]+)", user_message)
         return ("anova", {"value": v and v.group(1), "group": g.group(1) if g else (grp_hint if grp_hint else None)})
+
     return None
 
 # ---------- CLARIFICATION HELPERS ----------
@@ -568,6 +626,14 @@ def resolve_pending(pending: Dict, user_message: str, df: pd.DataFrame) -> Tuple
     g_match = re.search(r"group\s*=\s*([A-Za-z_][A-Za-z0-9_]*)", user_message)
     if v_match: value = v_match.group(1)
     if g_match: group = g_match.group(1)
+
+    # Histogram column pending
+    if wait == "hist_col":
+        col = _find_first_col_mention(user_message, df)
+        if not col or col not in df.columns or not pd.api.types.is_numeric_dtype(df[col]):
+            return None, "Please specify a numeric column for the histogram, e.g., `col=height`.", pending
+        bins = int(pending.get("bins", 30))
+        return ("plot", {"hist": {"col": col, "bins": bins}}), None, {}
 
     if wait in ("ttest_group", "anova_group"):
         if not group:
@@ -617,7 +683,7 @@ def handle_upload(file):
         return (
             [{"role": "assistant", "content": f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, hist/box/violin/bar, normality checks, power, or say **'what can I do with my data?'**"}],
             gr.update(value=preview, visible=True),
-            gr.update(visible=True),
+            gr.update(visible=False),   # download button hidden until results exist
             [], 0,   # plots_state, plot_index
             {}       # pending
         )
@@ -655,6 +721,8 @@ def handle_chat(chat_history, user_message, pending_state):
         if not explicit:
             # LLM fallback
             tool, llm_output = ask_llm(chat_history, user_message)
+            if tool:
+                tool = normalize_tool_call(tool)
 
     if explicit:
         action = explicit[0]; args = explicit[1]; tool_ok = True
@@ -775,24 +843,37 @@ def handle_chat(chat_history, user_message, pending_state):
                 new_pending = {}
 
             elif action == "plot":
+                # HIST (with local clarification)
                 if "hist" in args:
-                    p = args["hist"]; title, png = plot_hist(df, p.get("col"), int(p.get("bins", 30)))
+                    p = args["hist"]
+                    col = p.get("col")
+                    if not col or col not in df.columns or not pd.api.types.is_numeric_dtype(df[col]):
+                        nums = numeric_cols(df)
+                        opts = ", ".join(nums[:12]) + ("…" if len(nums) > 12 else "")
+                        msg = f"Which numeric column for the histogram? Candidates: {opts}"
+                        chat_history.extend([{"role":"user","content":user_message},{"role":"assistant","content":msg}])
+                        return (chat_history, gr.update(value=None), gr.update(value=None, visible=False),
+                                [], 0, {"action":"plot","await":"hist_col","bins": int(p.get("bins",30))})
+                    title, png = plot_hist(df, col, int(p.get("bins", 30)))
                     if png:
-                        fp = save_png(png, f"plot_hist_{p.get('col')}.png")
+                        fp = save_png(png, f"plot_hist_{col}.png")
                         plot_filepaths.append(fp); preview_path = fp
                     sections.append((title, "", png))
+
                 if "box" in args:
                     p = args["box"]; title, png = plot_box(df, p.get("value"), p.get("group"))
                     if png:
                         fp = save_png(png, f"plot_box_{p.get('value')}_{p.get('group')}.png")
                         plot_filepaths.append(fp); preview_path = fp
                     sections.append((title, "", png))
+
                 if "violin" in args:
                     p = args["violin"]; title, png = plot_violin(df, p.get("value"), p.get("group"))
                     if png:
                         fp = save_png(png, f"plot_violin_{p.get('value')}_{p.get('group')}.png")
                         plot_filepaths.append(fp); preview_path = fp
                     sections.append((title, "", png))
+
                 if "bar" in args:
                     p = args["bar"]
                     order = [str(x) for x in pd.unique(df[p.get("group")].dropna())] if p.get("group") in df.columns else None
@@ -859,7 +940,7 @@ def handle_chat(chat_history, user_message, pending_state):
         chat_history.append({"role": "assistant", "content": llm_output})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0, pending
     else:
-        chat_history.append({"role": "assistant", "content": "Try: `ttest value=height group=sex` (auto Bar±SEM, Box, Violin), `anova value=score group=treatment`, `ols score ~ weight`, or ask **“what can I do with my data?”**"})
+        chat_history.append({"role": "assistant", "content": "Try: `ttest value=height group=sex` (auto Bar±SEM, Box, Violin), `anova value=score group=treatment`, `ols score ~ weight`, `plot hist col=height`, or ask **“what can I do with my data?”**"})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), [], 0, pending
 
 # ---------- PLOT NAV ----------
@@ -922,7 +1003,7 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 type="messages",
                 value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test (auto Bar±SEM, Box, Violin), ANOVA, OLS/GLM, hist/box/violin/bar, normality, power — or say **“what can I do with my data?”**"}]
             )
-            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., ttest on sex  |  ttest value=height group=sex  |  ols score ~ weight", lines=1)
+            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., ttest on sex  |  ttest value=height group=sex  |  plot hist col=height  |  ols score ~ weight", lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
             with gr.Row():
