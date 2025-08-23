@@ -69,11 +69,9 @@ def fig_to_np(fig: plt.Figure) -> np.ndarray:
     fig.savefig(buf, format="png", dpi=160, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
-    # read back as numpy for gr.Image
     import PIL.Image as Image
     img = Image.open(buf).convert("RGB")
-    arr = np.array(img)
-    return arr
+    return np.array(img)
 
 def save_image_np(arr: np.ndarray, fname: str) -> str:
     fp = os.path.join(outputs_dir, fname)
@@ -133,7 +131,7 @@ def is_id_like(df: pd.DataFrame, col: str) -> bool:
     if not np.all(np.isfinite(as_float)):
         return False
     frac = np.abs(as_float - np.round(as_float))
-    if (frac > 1e-9).mean() > 0.05:   # many decimals → likely not ID
+    if (frac > 1e-9).mean() > 0.05:
         return False
     u = np.sort(pd.unique(np.round(as_float).astype(int)))
     if len(u) < 5:
@@ -143,28 +141,53 @@ def is_id_like(df: pd.DataFrame, col: str) -> bool:
         return False
     return (diffs == 1).mean() >= 0.9
 
+def is_integer_like(series: pd.Series) -> bool:
+    s = series.dropna()
+    if s.empty or not pd.api.types.is_numeric_dtype(s):
+        return False
+    frac = np.abs(s.astype(float) - np.round(s.astype(float)))
+    return (frac > 1e-9).mean() <= 0.05
+
 def infer_schema(df: pd.DataFrame) -> Dict:
+    """Classify columns conservatively.
+    - Numeric: pandas numeric dtypes.
+    - Categorical: non-numeric with low cardinality; OR integer-like numeric with very low unique (e.g., binary).
+    """
     n, p = df.shape
     numeric_all = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    categorical = []
+    categorical: List[str] = []
+
+    # Non-numeric low cardinality
     for c in df.columns:
-        # low-cardinality non-numeric or small unique count numeric
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            uniq = df[c].nunique(dropna=True)
+            if uniq <= max(20, int(0.2 * max(n, 1))):
+                categorical.append(c)
+
+    # Numeric integer-like with VERY low unique → treat as category (e.g., 0/1)
+    # Threshold scales with n but stays small: max(2, int(0.1*n)), capped at 5
+    cat_thresh = min(5, max(2, int(0.1 * max(n, 1))))
+    for c in numeric_all:
         uniq = df[c].nunique(dropna=True)
-        if (not pd.api.types.is_numeric_dtype(df[c]) and uniq <= max(20, int(0.2*n))) or (uniq <= 10 and c not in categorical and c not in numeric_all):
+        if is_integer_like(df[c]) and uniq <= cat_thresh:
             categorical.append(c)
-        elif uniq <= 10 and c not in categorical and c in numeric_all:
-            # numeric but low unique → treat as categorical candidate
-            categorical.append(c)
-    # also commonly used categorical columns if present
+
+    # Common categorical names
     for c in ["group", "sex", "treatment", "class", "category"]:
         if c in df.columns and c not in categorical:
             categorical.append(c)
-    # binary groups
-    binary = [c for c in df.columns if df[c].nunique(dropna=True) == 2 and c not in numeric_all]
+
+    # Binary groups (prefer non-numeric or integer-like numeric)
+    binary = []
+    for c in df.columns:
+        u = df[c].nunique(dropna=True)
+        if u == 2 and (not pd.api.types.is_numeric_dtype(df[c]) or is_integer_like(df[c])):
+            binary.append(c)
+
     return {
         "n_rows": n, "n_cols": p,
         "numeric_all": numeric_all,
-        "categorical": list(dict.fromkeys(categorical)),  # preserve order / unique
+        "categorical": list(dict.fromkeys(categorical)),
         "binary": binary
     }
 
@@ -175,7 +198,7 @@ def usable_numeric_cols(df: pd.DataFrame) -> List[str]:
     ordered = [c for c in priority if c in safe]
     ordered += [c for c in safe if c not in ordered]
     if not ordered and nums:
-        ordered = nums  # fall back if everything looked like ID
+        ordered = nums
     return ordered
 
 def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
@@ -188,12 +211,19 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
     nums_safe = usable_numeric_cols(df)
     y_num = nums_safe[0] if nums_safe else (nums_all[0] if nums_all else None)
 
-    g_bin = None
-    for c in (bins or []):
-        if c in df.columns and df[c].nunique(dropna=True) == 2:
-            g_bin = c
-            break
-    g_multi = next((c for c in cats if df[c].nunique(dropna=True) >= 3), (cats[0] if cats else None))
+    # valid groups
+    def valid_group(col: str, outcome: Optional[str]) -> bool:
+        if outcome and col == outcome:
+            return False
+        u = df[col].nunique(dropna=True)
+        # require at least 2 levels; if numeric, must be integer-like
+        if pd.api.types.is_numeric_dtype(df[col]):
+            return u >= 2 and is_integer_like(df[col])
+        else:
+            return u >= 2
+
+    g_bin = next((c for c in bins if valid_group(c, y_num)), None)
+    g_multi = next((c for c in cats if df[c].nunique(dropna=True) >= 3 and valid_group(c, y_num)), None)
 
     overview_lines = [f"Dataset overview: n={n} rows, p={p} columns."]
     if nums_all:
@@ -208,13 +238,17 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
     if y_num and g_bin:
         rec_lines.append(f"• Compare average **{y_num}** between the two groups in **{g_bin}** (t-test).")
         rec_lines.append(f"• **Bar chart with error bars** for **{y_num}** by **{g_bin}**.")
-    if y_num and g_multi and g_multi != g_bin:
+    if y_num and g_multi:
         rec_lines.append(f"• Compare **{y_num}** across levels of **{g_multi}** (one-way ANOVA).")
         rec_lines.append(f"• **Box/violin plots** of **{y_num}** across **{g_multi}**.")
     if len(nums_safe) >= 2:
         rec_lines.append(f"• See how one value predicts another (linear regression), e.g., **{nums_safe[0]} ~ {nums_safe[1]}**.")
     rec_lines.append("• **Normality check** with a QQ plot (assumption check).")
-    rec_lines.append("• **Power analysis** to estimate sample size for a planned test.")
+    # Power suggestions only if they make sense
+    if g_bin:
+        rec_lines.append("• **Power analysis** for a t-test to estimate sample size.")
+    if g_multi:
+        rec_lines.append("• **Power analysis** for one-way ANOVA to estimate sample size.")
 
     ex = ["Here are some things you can say:"]
     if y_num:
@@ -223,14 +257,16 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
     if y_num and g_bin:
         ex.append(f'• "I want to do a t-test on {y_num} by {g_bin}."')
         ex.append(f'• "Make a bar chart of {y_num} by {g_bin} with 95% CI."')
-    if y_num and g_multi and g_multi != g_bin:
+    if y_num and g_multi:
         ex.append(f'• "Run a one-way ANOVA of {y_num} by {g_multi}."')
         ex.append(f'• "Show box and violin plots for {y_num} by {g_multi}."')
     if len(nums_safe) >= 2:
         ex.append(f'• "Fit a linear regression: {nums_safe[0]} ~ {nums_safe[1]}."')
     ex.append('• "Check normality of the main outcome and show a QQ plot."')
-    ex.append('• "Power analysis for a t-test with 80% power and effect size 0.5."')
-    ex.append('• "Power analysis for a one-way ANOVA with 3 groups and 80% power."')
+    if g_bin:
+        ex.append('• "Power analysis for a t-test with 80% power and effect size 0.5."')
+    if g_multi:
+        ex.append('• "Power analysis for a one-way ANOVA with 3 groups and 80% power."')
 
     return "\n".join(overview_lines + [""] + rec_lines), "\n".join(ex)
 
@@ -241,7 +277,6 @@ def ordered_groups(df: pd.DataFrame, group_col: str) -> List[str]:
         return [str(x) for x in s.cat.categories]
     vals = [str(v) for v in s.dropna().unique().tolist()]
     try:
-        # natural-ish order if numeric-like strings
         vals_float = [float(v) for v in vals]
         order = [x for _, x in sorted(zip(vals_float, vals), key=lambda t: t[0])]
         return order
@@ -257,7 +292,6 @@ def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=Fals
     else:
         stat, p = stats.ttest_ind(a, b, equal_var=equal_var, nan_policy="omit")
         test_name = "Student t-test" if equal_var else "Welch t-test"
-        # Welch-Satterthwaite df
         va, vb = np.var(a, ddof=1), np.var(b, ddof=1)
         na, nb = len(a), len(b)
         df_est = (va/na + vb/nb)**2 / ((va**2)/((na**2)*(na-1)) + (vb**2)/((nb**2)*(nb-1)))
@@ -265,7 +299,6 @@ def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=Fals
     mean_a, mean_b = a.mean(), b.mean()
     sd_a, sd_b = a.std(ddof=1), b.std(ddof=1)
     diff = mean_a - mean_b
-    # CI for difference (Welch)
     se = np.sqrt(sd_a**2/len(a) + sd_b**2/len(b))
     try:
         tcrit = stats.t.ppf(0.975, df=df_est)
@@ -273,11 +306,8 @@ def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=Fals
     except Exception:
         ci_low = ci_high = np.nan
 
-    # effect sizes
-    # Pooled SD for Cohen's d (independent; for Welch it's approx.)
     sp = np.sqrt(((len(a)-1)*sd_a**2 + (len(b)-1)*sd_b**2) / (len(a)+len(b)-2)) if len(a)+len(b)-2 > 0 else np.nan
     d = diff / sp if sp and sp > 0 else np.nan
-    # Hedges' g
     J = 1 - (3 / (4*(len(a)+len(b)-2) - 1)) if (len(a)+len(b)-2) > 1 else 1.0
     g = d * J if d is not None else np.nan
 
@@ -298,20 +328,17 @@ def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=
     a = df[df[group].astype(str) == gorder[0]][value].dropna().astype(float).values
     b = df[df[group].astype(str) == gorder[1]][value].dropna().astype(float).values
 
-    # Box
     fig_box, ax = plt.subplots(figsize=(5,3))
     ax.boxplot([a, b], tick_labels=[gorder[0], gorder[1]])
     ax.set_title(f"Boxplot of {value} by {group}")
     img_box = fig_to_np(fig_box)
 
-    # Violin
     fig_vio, ax = plt.subplots(figsize=(5,3))
     ax.violinplot([a, b], showmeans=True)
     ax.set_xticks([1,2]); ax.set_xticklabels([gorder[0], gorder[1]])
     ax.set_title(f"Violin of {value} by {group}")
     img_vio = fig_to_np(fig_vio)
 
-    # Bar ± error (SEM by default)
     img_bar = bar_with_error_plot(df, value, group, error="sem", gorder=gorder)
 
     txt = ttest_summary(a, b, gorder[0], gorder[1], equal_var=equal_var, paired=paired)
@@ -325,13 +352,11 @@ def run_anova(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.nd
     F, p = stats.f_oneway(*data)
     txt = f"One-way ANOVA on {value} by {group}\nGroups: {', '.join(gorder)}\nF = {F:.4g}, p = {p:.5g}"
 
-    # Box
     fig_box, ax = plt.subplots(figsize=(6,3))
     ax.boxplot(data, tick_labels=gorder)
     ax.set_title(f"Boxplot of {value} by {group}")
     img_box = fig_to_np(fig_box)
 
-    # Violin
     fig_vio, ax = plt.subplots(figsize=(6,3))
     ax.violinplot(data, showmeans=True)
     ax.set_xticks(range(1, len(gorder)+1)); ax.set_xticklabels(gorder)
@@ -347,7 +372,6 @@ def run_ols(df: pd.DataFrame, formula: str) -> Tuple[str, List[np.ndarray]]:
 
     images: List[np.ndarray] = []
 
-    # scatter + fit if single X numeric
     lhs, rhs = [s.strip() for s in formula.split("~",1)]
     terms = [t.strip() for t in re.split(r"\+", rhs) if t.strip()]
     if len(terms) == 1 and terms[0] in df.columns and pd.api.types.is_numeric_dtype(df[terms[0]]):
@@ -359,14 +383,12 @@ def run_ols(df: pd.DataFrame, formula: str) -> Tuple[str, List[np.ndarray]]:
         ax.set_xlabel(terms[0]); ax.set_ylabel(lhs); ax.set_title("Scatter + OLS fit")
         images.append(fig_to_np(fig))
 
-    # residuals vs fitted
     fig_r, ax = plt.subplots(figsize=(6,3))
     ax.scatter(model.fittedvalues, model.resid)
     ax.axhline(0, linestyle=":")
     ax.set_xlabel("Fitted"); ax.set_ylabel("Residuals"); ax.set_title("Residuals vs Fitted")
     images.append(fig_to_np(fig_r))
 
-    # QQ
     sm.qqplot(model.resid, line="45", fit=True)
     images.append(fig_to_np(plt.gcf()))
 
@@ -426,11 +448,9 @@ def bar_with_error_plot(df: pd.DataFrame, value: str, group: str, error: str = "
     if gorder is None:
         gorder = ordered_groups(df, group)
     means, errs = [], []
-    ns = []
     for g in gorder:
         vals = df[df[group].astype(str) == g][value].dropna().astype(float).values
         n = len(vals)
-        ns.append(n)
         m = vals.mean() if n > 0 else np.nan
         if error == "sd":
             e = vals.std(ddof=1) if n > 1 else np.nan
@@ -466,7 +486,6 @@ def power_ttest_ind(effect_size: Optional[float], alpha: float, power: Optional[
         n2 = n1*ratio
         return f"Required total sample size (two-sample t-test): group1 ≈ {int(np.ceil(n1))}, group2 ≈ {int(np.ceil(n2))} (total ≈ {int(np.ceil(n1+n2))})"
     elif solve_for == "power":
-        # Here 'power' arg conveys nobs1
         pw = tool.solve_power(effect_size=effect_size, nobs1=power, alpha=alpha, ratio=ratio, alternative="two-sided")
         return f"Achieved power ≈ {pw:.3f}"
     elif solve_for == "effect_size":
@@ -491,7 +510,7 @@ def power_anova_oneway(effect_size: Optional[float], k_groups: int, alpha: float
 
 # ---------- QUICK SUMMARY ----------
 def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
-    if by and by in df.columns and df[by].nunique(dropna=True) > 1:
+    if by and by in df.columns and by != col and df[by].nunique(dropna=True) > 1:
         lines = [f"Summary of {col} by {by}:"]
         gorder = ordered_groups(df, by)
         for g in gorder:
@@ -529,44 +548,36 @@ def ask_llm(chat_history, user_input):
 def local_parse(user_input: str) -> Optional[Dict]:
     s = user_input.strip().lower()
 
-    # direct recommendations
     if re.search(r"\b(what can i do|how should i analyze|recommend|suggestion|what analyses)\b", s):
         return {"tool":"stats","action":"recommend","args":{}}
 
-    # quick summary: mean/sd/min/max (with optional "by")
     m = re.search(r"(?:what(?:'s| is) the )?(?:mean|average|summary|summarize|describe)\s+([a-zA-Z0-9_]+)(?:\s+by\s+([a-zA-Z0-9_]+))?", s)
     if m:
         col = m.group(1)
         by = m.group(2) if m.group(2) else None
         return {"tool":"stats","action":"summary","args":{"col":col, "by":by}}
 
-    # t-test natural: "t-test on score by sex"
     m = re.search(r"(t[\-\s]?test).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
         return {"tool":"stats","action":"ttest","args":{"value":m.group(2), "group":m.group(3)}}
 
-    # ANOVA: "anova of score by group"
     m = re.search(r"(anova).*(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
         return {"tool":"stats","action":"anova","args":{"value":m.group(2), "group":m.group(3)}}
 
-    # OLS / regression: "ols y ~ x", or "regression y ~ x"
     m = re.search(r"(?:ols|regression)\s+([a-zA-Z0-9_]+)\s*~\s*([a-zA-Z0-9_+\s]+)", s)
     if m:
         return {"tool":"stats","action":"ols","args":{"formula": f"{m.group(1)} ~ {m.group(2)}"}}
 
-    # GLM: "poisson/glm y ~ x"
     m = re.search(r"(glm|poisson|binomial|gaussian|gamma)\s+([a-zA-Z0-9_]+)\s*~\s*([a-zA-Z0-9_+\s]+)", s)
     if m:
         fam = "gaussian" if m.group(1) == "glm" else m.group(1)
         return {"tool":"stats","action":"glm","args":{"formula": f"{m.group(2)} ~ {m.group(3)}", "family":fam}}
 
-    # histogram
     m = re.search(r"(hist(?:ogram)?)\s+(?:of|on|for)?\s*([a-zA-Z0-9_]+)", s)
     if m:
         return {"tool":"stats","action":"plot","args":{"hist":{"col":m.group(2),"bins":30}}}
 
-    # box/violin/bar
     m = re.search(r"(box|violin|bar)\s+(?:plot\s+)?(?:of|on|for)?\s*([a-zA-Z0-9_]+)\s+(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
         kind, val, grp = m.group(1), m.group(2), m.group(3)
@@ -577,18 +588,15 @@ def local_parse(user_input: str) -> Optional[Dict]:
         if kind == "bar":
             return {"tool":"stats","action":"plot","args":{"bar":{"value":val,"group":grp,"error":"ci95"}}}
 
-    # normality check
     m = re.search(r"(normality|qq)\s+(?:check|plot)?\s*(?:for|of)?\s*([a-zA-Z0-9_]+)", s)
     if m:
         return {"tool":"stats","action":"check","args":{"normality":{"col":m.group(2)}}}
 
-    # power t-test / anova (simple)
     if "power" in s and "t-test" in s:
         return {"tool":"stats","action":"power","args":{"ttest_ind":{"effect_size":0.5,"alpha":0.05,"power":0.8,"ratio":1.0,"solve_for":"n_total"}}}
     if "power" in s and "anova" in s:
         return {"tool":"stats","action":"power","args":{"anova_oneway":{"effect_size":0.25,"k_groups":3,"alpha":0.05,"power":0.8,"solve_for":"n_per_group"}}}
 
-    # explicit JSON command pass-through (advanced users)
     try:
         maybe = json.loads(user_input)
         if isinstance(maybe, dict) and "tool" in maybe:
@@ -606,7 +614,6 @@ def handle_upload(file):
         df = pd.read_csv(file)
         cached_df = df
         cols = ", ".join(map(str, df.columns))
-        # prepare preview (first 200 rows)
         preview = df.head(200)
         return (
             [{"role":"assistant","content":f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, hist/box/violin/bar, normality checks, power, quick summaries (e.g., 'What is the average height?'), or say 'what can I do with my data?'"}],
@@ -622,8 +629,11 @@ def handle_upload(file):
 
 def need_value_and_group(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     nums = usable_numeric_cols(df)
-    groups = [c for c in df.columns if df[c].nunique(dropna=True) == 2 or df[c].nunique(dropna=True) >= 2]
-    # Prefer nice group names
+    groups = []
+    for c in df.columns:
+        if df[c].nunique(dropna=True) >= 2:
+            if not pd.api.types.is_numeric_dtype(df[c]) or is_integer_like(df[c]):
+                groups.append(c)
     prefer = ["sex","group","treatment","class","category"]
     ordered_groups = [c for c in prefer if c in groups] + [c for c in groups if c not in prefer]
     return nums, ordered_groups
@@ -634,7 +644,6 @@ def handle_chat(chat_history, user_message, data_preview):
     chat_history = list(chat_history)
     text = user_message.strip()
 
-    # Try LLM first (if available), else local parse.
     parsed = None
     llm_error_text = None
     if llm_available:
@@ -647,12 +656,9 @@ def handle_chat(chat_history, user_message, data_preview):
     else:
         parsed = local_parse(text)
 
-    # If we asked for a follow-up earlier but this message clearly contains a full action,
-    # we cancel the pending follow-up.
     if pending["action"] and parsed and parsed.get("tool") == "stats":
         pending = {"action": None, "need": None, "args": None}
 
-    # If still nothing parsed, just reply naturally (short)
     if not parsed:
         reply = "I can help with t-tests, ANOVA, OLS/GLM, hist/box/violin/bar, normality, power, and quick summaries. Try: 'I want a t-test on score by sex' or 'Show a histogram of height'."
         if llm_error_text:
@@ -703,13 +709,14 @@ def handle_chat(chat_history, user_message, data_preview):
         if action == "ttest":
             value = args.get("value")
             group = args.get("group")
-            # Ask for missing pieces (but cancel if user issues a new complete command later)
             if not value or not group:
                 nums, groups = need_value_and_group(df)
                 pending.update({"action":"ttest","need":"value" if not value else "group","args":{"value":value,"group":group}})
                 ask = "Which numeric outcome should I test? Candidates: " + ", ".join(nums) if not value else "Which group column? Candidates: " + ", ".join(groups)
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
                 return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+            if value == group:
+                raise gr.Error("Outcome and group must be different.")
             txt, imgs = run_ttest(df, value=value, group=group, paired=bool(args.get("paired", False)), equal_var=bool(args.get("equal_var", False)))
             sections.append(("t-test", txt, None))
             for i, im in enumerate(imgs):
@@ -727,6 +734,10 @@ def handle_chat(chat_history, user_message, data_preview):
                 ask = "Which numeric outcome for ANOVA? Candidates: " + ", ".join(nums) if not value else "Which group column for ANOVA? Candidates: " + ", ".join(groups)
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
                 return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+            if value == group:
+                raise gr.Error("Outcome and group must be different.")
+            if df[group].nunique(dropna=True) < 2:
+                raise gr.Error(f"ANOVA needs ≥2 groups; '{group}' has {df[group].nunique(dropna=True)}.")
             txt, imgs = run_anova(df, value=value, group=group)
             sections.append(("ANOVA", txt, None))
             for i, im in enumerate(imgs):
@@ -759,24 +770,29 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- PLOTS --------
         elif action == "plot":
-            # hist
             if "hist" in args:
                 p = args["hist"]; title, im = plot_hist(df, p.get("col"), int(p.get("bins",30)))
                 images.append(im); save_image_np(im, f"plot_hist_{p.get('col')}.png"); sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
-            # box
             if "box" in args:
-                p = args["box"]; title, im = plot_box(df, p.get("value"), p.get("group"))
+                p = args["box"]
+                if p.get("value") == p.get("group"):
+                    raise gr.Error("Outcome and group must be different.")
+                title, im = plot_box(df, p.get("value"), p.get("group"))
                 images.append(im); save_image_np(im, f"plot_box_{p.get('value')}_{p.get('group')}.png"); sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
-            # violin
             if "violin" in args:
-                p = args["violin"]; title, im = plot_violin(df, p.get("value"), p.get("group"))
+                p = args["violin"]
+                if p.get("value") == p.get("group"):
+                    raise gr.Error("Outcome and group must be different.")
+                title, im = plot_violin(df, p.get("value"), p.get("group"))
                 images.append(im); save_image_np(im, f"plot_violin_{p.get('value')}_{p.get('group')}.png"); sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
-            # bar
             if "bar" in args:
-                p = args["bar"]; err = p.get("error","sem")
+                p = args["bar"]
+                if p.get("value") == p.get("group"):
+                    raise gr.Error("Outcome and group must be different.")
+                err = p.get("error","sem")
                 gorder = ordered_groups(df, p.get("group"))
                 im = bar_with_error_plot(df, p.get("value"), p.get("group"), error=err, gorder=gorder)
                 images.append(im); save_image_np(im, f"plot_bar_{p.get('value')}_{p.get('group')}_{err}.png"); sections.append((f"Bar {p.get('value')}~{p.get('group')}", "", im))
@@ -814,7 +830,6 @@ def handle_chat(chat_history, user_message, data_preview):
         chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
 
-    # Build report/zip and choose a preview image
     report_fp = write_report(sections)
     zip_fp = save_zip()
     preview = images[-1] if images else None
