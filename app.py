@@ -13,11 +13,16 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import gradio as gr
 from dotenv import load_dotenv
-from together import Together
 from scipy import stats
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.power import TTestIndPower, FTestAnovaPower
+
+# Optional Together client (lazy init below so missing key won't crash import)
+try:
+    from together import Together
+except Exception:
+    Together = None  # type: ignore
 
 print("Starting SpatChat: Stats Room (chat-first)")
 
@@ -28,7 +33,9 @@ os.makedirs(outputs_dir, exist_ok=True)
 
 # ---------- LLM SETUP (Together API) ----------
 load_dotenv()
-client = Together(api_key=os.getenv("TOGETHER_API_KEY"))
+TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
+LLM_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"
+_llm_client = None  # lazy
 
 SYSTEM_PROMPT = """
 You are SpatChat, an expert statistics assistant for basic analyses.
@@ -81,6 +88,75 @@ def df_to_html(df: pd.DataFrame) -> str:
     return df.to_html(index=False, escape=False)
 
 
+def numeric_cols(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+
+def categorical_cols(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+
+
+def guess_ttest_args(df: pd.DataFrame, value: Optional[str], group: Optional[str]) -> Tuple[str, str]:
+    # Prefer provided; otherwise choose sensible defaults
+    g = group
+    if g is None:
+        for cand in ["sex", "group", "am"]:
+            if cand in df.columns:
+                g = cand
+                break
+        if g is None:
+            # any categorical with exactly 2 unique values
+            for cand in df.columns:
+                if len(df[cand].dropna().unique()) == 2:
+                    g = cand
+                    break
+    if g is None:
+        raise gr.Error("Couldn't infer group column for t-test. Specify group=<column>.")
+
+    v = value
+    if v is None:
+        if "score" in df.columns and pd.api.types.is_numeric_dtype(df["score"]):
+            v = "score"
+        else:
+            for cand in numeric_cols(df):
+                if cand != g:
+                    v = cand
+                    break
+    if v is None:
+        raise gr.Error("Couldn't infer numeric value column for t-test. Specify value=<column>.")
+    return v, g
+
+
+def guess_anova_args(df: pd.DataFrame, value: Optional[str], group: Optional[str]) -> Tuple[str, str]:
+    g = group
+    if g is None:
+        for cand in ["group", "treatment"]:
+            if cand in df.columns:
+                g = cand
+                break
+        if g is None:
+            # any categorical with >=2 levels
+            for cand in df.columns:
+                if len(df[cand].dropna().unique()) >= 2 and not pd.api.types.is_numeric_dtype(df[cand]):
+                    g = cand
+                    break
+    if g is None:
+        raise gr.Error("Couldn't infer group factor for ANOVA. Specify group=<column>.")
+
+    v = value
+    if v is None:
+        if "score" in df.columns and pd.api.types.is_numeric_dtype(df["score"]):
+            v = "score"
+        else:
+            for cand in numeric_cols(df):
+                if cand != g:
+                    v = cand
+                    break
+    if v is None:
+        raise gr.Error("Couldn't infer numeric value for ANOVA. Specify value=<column>.")
+    return v, g
+
+
 # ---------- ANALYSES ----------
 
 @dataclass
@@ -106,9 +182,9 @@ def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=
         stat, p = stats.ttest_ind(a, b, equal_var=equal_var, nan_policy="omit")
         test_name = "Welch t-test" if not equal_var else "Student t-test"
 
-    # Boxplot
+    # Boxplot (Matplotlib 3.9+: use tick_labels)
     fig_box, ax = plt.subplots(figsize=(5, 3))
-    ax.boxplot([a, b], labels=[str(gvals[0]), str(gvals[1])])
+    ax.boxplot([a, b], tick_labels=[str(gvals[0]), str(gvals[1])])
     ax.set_title("Boxplot by Group")
     png_box = fig_to_png(fig_box)
 
@@ -323,10 +399,28 @@ def clear_outputs():
 
 # ---------- CHAT HANDLERS ----------
 
+def _get_llm_client():
+    global _llm_client
+    if _llm_client is not None:
+        return _llm_client
+    if Together is None or not TOGETHER_API_KEY:
+        return None
+    _llm_client = Together(api_key=TOGETHER_API_KEY)
+    return _llm_client
+
+
 def ask_llm(chat_history, user_input):
+    client = _get_llm_client()
+    if client is None:
+        # Friendly message if key missing; user can still run explicit commands
+        return None, ("TOGETHER_API_KEY not set. You can still run explicit commands like:\n"
+                      " - ttest value=score group=sex\n"
+                      " - anova value=score group=group\n"
+                      " - ols score ~ weight + height\n"
+                      "Or set the key in Settings → Variables & secrets.")
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history + [{"role": "user", "content": user_input}]
     resp = client.chat.completions.create(
-        model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+        model=LLM_MODEL,
         messages=messages,
         temperature=0.0
     ).choices[0].message.content
@@ -335,7 +429,7 @@ def ask_llm(chat_history, user_input):
         return call, resp
     except Exception:
         conv = client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo-Free",
+            model=LLM_MODEL,
             messages=[{"role": "system", "content": FALLBACK_PROMPT}] + messages,
             temperature=0.7
         ).choices[0].message.content
@@ -359,32 +453,42 @@ def handle_chat(chat_history, user_message):
     chat_history = list(chat_history)
     tool, llm_output = ask_llm(chat_history, user_message)
 
-    if tool and tool.get("tool") == "stats":
-        action = tool.get("action"); args = tool.get("args", {})
+    # Try to parse simple explicit commands if no tool JSON
+    explicit_tool = None
+    if not tool:
+        m = re.match(r"\s*(ttest|anova)\b", user_message.lower())
+        if m:
+            explicit_tool = m.group(1)
+
+    if tool and tool.get("tool") == "stats" or explicit_tool in {"ttest", "anova"}:
+        action = (tool.get("action") if tool else explicit_tool)
+        args = (tool.get("args", {}) if tool else {})
         if cached_df is None:
             chat_history.append({"role": "assistant", "content": "Please upload a CSV first."})
             return chat_history, gr.update(value=None), gr.update(value=None, visible=False)
         df = cached_df.copy()
         sections: List[Tuple[str, str, Optional[bytes]]] = []
-        images: List[bytes] = []
-        # --- Dispatch ---
+        preview_path: Optional[str] = None
+
         try:
             if action == "ttest":
-                out = run_ttest(df, value=args.get("value"), group=args.get("group"), paired=bool(args.get("paired", False)), equal_var=bool(args.get("equal_var", False)))
+                val, grp = guess_ttest_args(df, args.get("value"), args.get("group"))
+                out = run_ttest(df, value=val, group=grp,
+                                paired=bool(args.get("paired", False)),
+                                equal_var=bool(args.get("equal_var", False)))
                 if out.table is not None:
                     out.table.to_csv(os.path.join(outputs_dir, "ttest_table.csv"), index=False)
                 for title, png in (out.plots or []):
                     if png:
-                        images.append(png)
-                        save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
+                        preview_path = save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
                 sections.append((out.kind, out.summary_text, None))
 
             elif action == "anova":
-                out = run_anova(df, value=args.get("value"), group=args.get("group"))
+                val, grp = guess_anova_args(df, args.get("value"), args.get("group"))
+                out = run_anova(df, value=val, group=grp)
                 for title, png in (out.plots or []):
                     if png:
-                        images.append(png)
-                        save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
+                        preview_path = save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
                 sections.append((out.kind, out.summary_text, None))
 
             elif action == "ols":
@@ -393,8 +497,7 @@ def handle_chat(chat_history, user_message):
                     out.table.to_csv(os.path.join(outputs_dir, "ols_coef.csv"), index=False)
                 for title, png in (out.plots or []):
                     if png:
-                        images.append(png)
-                        save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
+                        preview_path = save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
                 sections.append((out.kind, out.summary_text, None))
 
             elif action == "glm":
@@ -403,36 +506,31 @@ def handle_chat(chat_history, user_message):
                     out.table.to_csv(os.path.join(outputs_dir, "glm_coef.csv"), index=False)
                 for title, png in (out.plots or []):
                     if png:
-                        images.append(png)
-                        save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
+                        preview_path = save_png(png, f"plot_{title.replace(' ', '_').lower()}.png")
                 sections.append((out.kind, out.summary_text, None))
 
             elif action == "plot":
                 if "hist" in args:
                     p = args["hist"]; title, png = plot_hist(df, p.get("col"), int(p.get("bins", 30)))
                     if png:
-                        images.append(png)
-                        save_png(png, f"plot_hist_{p.get('col')}.png")
+                        preview_path = save_png(png, f"plot_hist_{p.get('col')}.png")
                     sections.append((title, "", png))
                 if "box" in args:
                     p = args["box"]; title, png = plot_box(df, p.get("value"), p.get("group"))
                     if png:
-                        images.append(png)
-                        save_png(png, f"plot_box_{p.get('value')}_{p.get('group')}.png")
+                        preview_path = save_png(png, f"plot_box_{p.get('value')}_{p.get('group')}.png")
                     sections.append((title, "", png))
                 if "violin" in args:
                     p = args["violin"]; title, png = plot_violin(df, p.get("value"), p.get("group"))
                     if png:
-                        images.append(png)
-                        save_png(png, f"plot_violin_{p.get('value')}_{p.get('group')}.png")
+                        preview_path = save_png(png, f"plot_violin_{p.get('value')}_{p.get('group')}.png")
                     sections.append((title, "", png))
 
             elif action == "check":
                 if "normality" in args:
                     p = args["normality"]; msg, png = check_normality(df, p.get("col"))
                     if png:
-                        images.append(png)
-                        save_png(png, f"plot_qq_{p.get('col')}.png")
+                        preview_path = save_png(png, f"plot_qq_{p.get('col')}.png")
                     sections.append(("Normality", msg, png))
                 if "homogeneity" in args:
                     p = args["homogeneity"]; msg = check_homogeneity(df, p.get("value"), p.get("group"))
@@ -441,26 +539,27 @@ def handle_chat(chat_history, user_message):
             elif action == "power":
                 if "ttest_ind" in args:
                     p = args["ttest_ind"]
-                    msg = power_ttest_ind(p.get("effect_size"), float(p.get("alpha", 0.05)), p.get("power"), float(p.get("ratio", 1.0)), p.get("solve_for", "n_total"))
+                    msg = power_ttest_ind(p.get("effect_size"), float(p.get("alpha", 0.05)),
+                                          p.get("power"), float(p.get("ratio", 1.0)),
+                                          p.get("solve_for", "n_total"))
                     sections.append(("Power – t-test (ind)", msg, None))
                 if "anova_oneway" in args:
                     p = args["anova_oneway"]
-                    msg = power_anova_oneway(p.get("effect_size"), int(p.get("k_groups", 3)), float(p.get("alpha", 0.05)), p.get("power"), p.get("solve_for", "n_per_group"))
+                    msg = power_anova_oneway(p.get("effect_size"), int(p.get("k_groups", 3)),
+                                             float(p.get("alpha", 0.05)), p.get("power"),
+                                             p.get("solve_for", "n_per_group"))
                     sections.append(("Power – ANOVA (one-way)", msg, None))
-
             else:
                 sections.append(("Note", f"Unknown action: {action}", None))
+
         except Exception as e:
             sections.append(("Error", str(e), None))
 
-        # Build HTML report and ZIP
         _ = write_report(sections)
         zip_fp = save_zip()
         chat_history.append({"role": "user", "content": user_message})
         chat_history.append({"role": "assistant", "content": "Done. See preview and use Download Results."})
-
-        preview = images[-1] if images else None
-        return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True)
+        return chat_history, gr.update(value=preview_path), gr.update(value=zip_fp, visible=True)
 
     # Not a tool call → natural language reply
     if llm_output:
@@ -468,7 +567,7 @@ def handle_chat(chat_history, user_message):
         chat_history.append({"role": "assistant", "content": llm_output})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False)
     else:
-        chat_history.append({"role": "assistant", "content": "How can I help? Upload a CSV and try: 'ttest value=mpg group=am', 'ols mpg ~ wt + hp', 'plot hist col=hp', or 'power ttest_ind effect_size=0.5 power=0.8'."})
+        chat_history.append({"role": "assistant", "content": "How can I help? Upload a CSV and try: 'ttest value=score group=sex', 'anova value=score group=group', 'ols score ~ weight + height'."})
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False)
 
 
@@ -515,10 +614,10 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 type="messages",
                 value=[{"role": "assistant", "content": "Welcome! Upload a CSV, then ask: t-test, ANOVA, OLS/GLM, histogram, box/violin, normality, or power analysis."}]
             )
-            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., ols mpg ~ wt + hp", lines=1)
+            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., ols score ~ weight + height", lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
-            preview_plot = gr.Image(label="Preview (last figure)")
+            preview_plot = gr.Image(label="Preview (last figure)", type="filepath")
             download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False)
 
     file_input.change(handle_upload, inputs=file_input, outputs=[chatbot, download_btn])
