@@ -368,7 +368,7 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
 
     overview_lines = [f"Dataset overview: n={n} rows, p={p} columns."]
     if nums_all:
-        overview_lines.append(f"- Numeric columns ({len(nums_all)}): {', '.join(map(str, nums_all[:8]))}{'…' if len(nums_all)>8 else ''}")
+        overview_lines.append(f"- Numeric columns ({len(nums_all)}): {', ',}.join(map(str, nums_all[:8])){'…' if len(nums_all)>8 else ''}")
     if cats:
         overview_lines.append(f"- Categorical/low-cardinality ({len(cats)}): {', '.join(map(str, cats[:8]))}{'…' if len(cats)>8 else ''}")
 
@@ -1046,6 +1046,14 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
     <style>
     #logo-img img { height: 90px; margin: 10px 50px 10px 10px; border-radius: 6px; }
     .dataframe-wrap { max-height: 340px; overflow: auto; border: 1px solid #ddd; border-radius: 6px; padding: 6px; }
+    /* NEW: keep nav buttons tight under the preview and right-aligned */
+    #preview-plot { margin-bottom: 6px; }
+    #plot-nav {
+      margin: 0 0 10px 0;
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+    }
     </style>
     """)
     gr.Markdown("## 📊 SpatChat: Stats Room {stats}")
@@ -1079,13 +1087,20 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
             user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., I want a t-test on score by sex", lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
-            preview_plot = gr.Image(label="Preview (last figure)", value=None, type="filepath")
-            data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
-            download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False)
+            preview_plot = gr.Image(
+                label="Preview (last figure)",
+                value=None,
+                type="filepath",
+                elem_id="preview-plot"
+            )
 
-            with gr.Row():
+            # Buttons directly under the plot (not at bottom)
+            with gr.Row(elem_id="plot-nav"):
                 prev_btn = gr.Button("◀️ Prev", variant="secondary")
                 next_btn = gr.Button("Next ▶️", variant="secondary")
+
+            data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
+            download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False)
 
             # Gallery states
             gallery_paths = gr.State([])
