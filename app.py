@@ -396,7 +396,6 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
         ex.append(f'• "Show a histogram of {y_num}."')
     if y_num and g_bin:
         ex.append(f'• "I want to do a t-test on {y_num} by {g_bin}."')
-        ex.append(f'• "Make a bar chart of {y_num} by {g_bin} with 95% CI."')
     if y_num and g_multi:
         ex.append(f'• "Run a one-way ANOVA of {y_num} by {g_multi}."')
         ex.append(f'• "Show box and violin plots for {y_num} by {g_multi}."')
@@ -440,12 +439,10 @@ def sanitize_args(action: Optional[str], args: Dict) -> Dict:
         args["by"] = clean_null_like(args.get("by"))
     elif action in {"ttest", "anova"}:
         args["group"] = clean_null_like(args.get("group"))
-        # leave 'value' as-is
     elif action == "plot":
         for k in ("box", "violin", "bar"):
             if k in args and isinstance(args[k], dict):
                 args[k]["group"] = clean_null_like(args[k].get("group"))
-    # for other actions, nothing special needed
     return args
 
 # ---------- ANALYSES ----------
@@ -748,7 +745,7 @@ def local_parse(user_input: str) -> Optional[Dict]:
 
     m = re.search(r"(normality|qq)\s+(?:check|plot)?\s*(?:for|of)?\s*([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"check","args":{"normality":{"col":m.group(2)}}}
+        return {"tool":"stats","action":"check","args":{"normality":{"col":"{}".format(m.group(2))}}}
 
     if "power" in s and "t-test" in s:
         return {"tool":"stats","action":"power","args":{"ttest_ind":{"effect_size":0.5,"alpha":0.05,"power":0.8,"ratio":1.0,"solve_for":"n_total"}}}
@@ -796,6 +793,21 @@ def need_value_and_group(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     ordered_groups = [c for c in prefer if c in groups] + [c for c in groups if c not in prefer]
     return nums, ordered_groups
 
+# ---------- GALLERY (Prev/Next) ----------
+def _safe_last(paths: List[str]) -> Tuple[Optional[str], List[str], int]:
+    """Return (preview, paths, idx). If empty, preview=None and idx=-1."""
+    if paths:
+        return paths[-1], paths, len(paths) - 1
+    return None, [], -1
+
+def _step(paths: List[str], idx: int, delta: int) -> Tuple[Optional[str], int]:
+    """Move idx by delta with wrap-around. Returns (preview, new_idx)."""
+    if not paths:
+        return None, -1
+    n = len(paths)
+    new_idx = (idx + delta) % n
+    return paths[new_idx], new_idx
+
 def handle_chat(chat_history, user_message, data_preview):
     global cached_df, pending
 
@@ -819,22 +831,27 @@ def handle_chat(chat_history, user_message, data_preview):
         if llm_error_text:
             reply = llm_error_text + " " + reply
         chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":reply}])
-        return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+        # no images produced
+        preview, paths, idx = _safe_last([])
+        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
 
     if parsed.get("tool") != "stats":
         chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":"I'm not sure how to handle that yet."}])
-        return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+        preview, paths, idx = _safe_last([])
+        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
 
     action = parsed.get("action")
-    args = sanitize_args(action, parsed.get("args", {}))  # <---- NEW: sanitize 'null'-like args
+    args = sanitize_args(action, parsed.get("args", {}))  # sanitize 'null'-like args
 
     if cached_df is None:
         chat_history.append({"role":"assistant","content":"Please upload a CSV first."})
-        return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+        preview, paths, idx = _safe_last([])
+        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
 
     df = cached_df.copy()
     sections: List[Tuple[str, str, Optional[np.ndarray]]] = []
     images: List[np.ndarray] = []
+    image_paths: List[str] = []
 
     try:
         # -------- Recommendations --------
@@ -844,7 +861,8 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Recommendations", msg, None))
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
             report_fp = write_report(sections); zip_fp = save_zip()
-            return chat_history, gr.update(value=None), gr.update(value=zip_fp, visible=True), data_preview
+            preview, paths, idx = _safe_last([])
+            return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx
 
         # -------- Summary --------
         if action == "summary":
@@ -852,14 +870,14 @@ def handle_chat(chat_history, user_message, data_preview):
             by = args.get("by")  # already sanitized to None if null-like
             if col not in df.columns:
                 raise gr.Error(f"Column '{col}' not found.")
-            # Only error if a REAL non-null-like group was supplied but doesn't exist
             if by is not None and by not in df.columns:
                 raise gr.Error(f"Group column '{by}' not found.")
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
             report_fp = write_report(sections); zip_fp = save_zip()
-            return chat_history, gr.update(value=None), gr.update(value=zip_fp, visible=True), data_preview
+            preview, paths, idx = _safe_last([])
+            return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx
 
         # -------- t-test --------
         if action == "ttest":
@@ -870,7 +888,8 @@ def handle_chat(chat_history, user_message, data_preview):
                 pending.update({"action":"ttest","need":"value" if not value else "group","args":{"value":value,"group":group}})
                 ask = "Which numeric outcome should I test? Candidates: " + ", ".join(nums) if not value else "Which group column? Candidates: " + ", ".join(groups)
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
-                return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
             if value == group:
                 raise gr.Error("Outcome and group must be different.")
             txt, imgs = run_ttest(df, value=value, group=group, paired=bool(args.get("paired", False)), equal_var=bool(args.get("equal_var", False)))
@@ -878,7 +897,8 @@ def handle_chat(chat_history, user_message, data_preview):
             for i, im in enumerate(imgs):
                 if im is not None:
                     images.append(im)
-                    save_image_np(im, f"ttest_plot_{i+1}.png")
+                    pth = save_image_np(im, f"ttest_plot_{i+1}.png")
+                    image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
         # -------- ANOVA --------
@@ -890,7 +910,8 @@ def handle_chat(chat_history, user_message, data_preview):
                 pending.update({"action":"anova","need":"value" if not value else "group","args":{"value":value,"group":group}})
                 ask = "Which numeric outcome for ANOVA? Candidates: " + ", ".join(nums) if not value else "Which group column for ANOVA? Candidates: " + ", ".join(groups)
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
-                return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
             if value == group:
                 raise gr.Error("Outcome and group must be different.")
             if df[group].nunique(dropna=True) < 2:
@@ -898,7 +919,8 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = run_anova(df, value=value, group=group)
             sections.append(("ANOVA", txt, None))
             for i, im in enumerate(imgs):
-                images.append(im); save_image_np(im, f"anova_plot_{i+1}.png")
+                pth = save_image_np(im, f"anova_plot_{i+1}.png")
+                image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
         # -------- OLS --------
@@ -906,11 +928,13 @@ def handle_chat(chat_history, user_message, data_preview):
             formula = args.get("formula")
             if not formula or "~" not in formula:
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":"Please specify a formula like: ols score ~ age + weight"}])
-                return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
             txt, imgs = run_ols(df, formula=formula)
             sections.append(("OLS", txt, None))
             for i, im in enumerate(imgs):
-                images.append(im); save_image_np(im, f"ols_plot_{i+1}.png")
+                pth = save_image_np(im, f"ols_plot_{i+1}.png")
+                image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
         # -------- GLM --------
@@ -918,18 +942,21 @@ def handle_chat(chat_history, user_message, data_preview):
             formula = args.get("formula"); family = args.get("family","gaussian")
             if not formula or "~" not in formula:
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":"Please specify a formula like: glm count ~ age family=poisson"}])
-                return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
             txt, imgs = run_glm(df, formula=formula, family=family)
             sections.append((f"GLM ({family})", txt, None))
             for i, im in enumerate(imgs):
-                images.append(im); save_image_np(im, f"glm_plot_{i+1}.png")
+                pth = save_image_np(im, f"glm_plot_{i+1}.png")
+                image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
         # -------- PLOTS --------
         elif action == "plot":
             if "hist" in args:
                 p = args["hist"]; title, im = plot_hist(df, p.get("col"), int(p.get("bins",30)))
-                images.append(im); save_image_np(im, f"plot_hist_{p.get('col')}.png"); sections.append((title, "", im))
+                pth = save_image_np(im, f"plot_hist_{p.get('col')}.png"); image_paths.append(pth)
+                sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
             if "box" in args:
                 p = args["box"]
@@ -938,11 +965,13 @@ def handle_chat(chat_history, user_message, data_preview):
                     nums, groups = need_value_and_group(df)
                     ask = "Which group column for the box plot? Candidates: " + ", ".join(groups)
                     chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
-                    return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                    preview, paths, idx = _safe_last([])
+                    return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
                 if p.get("value") == grp:
                     raise gr.Error("Outcome and group must be different.")
                 title, im = plot_box(df, p.get("value"), grp)
-                images.append(im); save_image_np(im, f"plot_box_{p.get('value')}_{grp}.png"); sections.append((title, "", im))
+                pth = save_image_np(im, f"plot_box_{p.get('value')}_{grp}.png"); image_paths.append(pth)
+                sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
             if "violin" in args:
                 p = args["violin"]
@@ -951,11 +980,13 @@ def handle_chat(chat_history, user_message, data_preview):
                     nums, groups = need_value_and_group(df)
                     ask = "Which group column for the violin plot? Candidates: " + ", ".join(groups)
                     chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
-                    return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                    preview, paths, idx = _safe_last([])
+                    return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
                 if p.get("value") == grp:
                     raise gr.Error("Outcome and group must be different.")
                 title, im = plot_violin(df, p.get("value"), grp)
-                images.append(im); save_image_np(im, f"plot_violin_{p.get('value')}_{grp}.png"); sections.append((title, "", im))
+                pth = save_image_np(im, f"plot_violin_{p.get('value')}_{grp}.png"); image_paths.append(pth)
+                sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
             if "bar" in args:
                 p = args["bar"]
@@ -964,20 +995,22 @@ def handle_chat(chat_history, user_message, data_preview):
                     nums, groups = need_value_and_group(df)
                     ask = "Which group column for the bar chart? Candidates: " + ", ".join(groups)
                     chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
-                    return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                    preview, paths, idx = _safe_last([])
+                    return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
                 if p.get("value") == grp:
                     raise gr.Error("Outcome and group must be different.")
                 err = p.get("error","sem")
                 gorder = ordered_groups(df, grp)
                 im = bar_with_error_plot(df, p.get("value"), grp, error=err, gorder=gorder)
-                images.append(im); save_image_np(im, f"plot_bar_{p.get('value')}_{grp}_{err}.png"); sections.append((f"Bar {p.get('value')}~{grp}", "", im))
+                pth = save_image_np(im, f"plot_bar_{p.get('value')}_{grp}_{err}.png"); image_paths.append(pth)
+                sections.append((f"Bar {p.get('value')}~{grp}", "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"Bar ± {err.upper()} generated."}])
 
         # -------- CHECKS --------
         elif action == "check":
             if "normality" in args:
                 p = args["normality"]; msg, im = check_normality(df, p.get("col"))
-                images.append(im); save_image_np(im, f"plot_qq_{p.get('col')}.png")
+                pth = save_image_np(im, f"plot_qq_{p.get('col')}.png"); image_paths.append(pth)
                 sections.append(("Normality", msg, im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
 
@@ -986,16 +1019,18 @@ def handle_chat(chat_history, user_message, data_preview):
 
     except gr.Error as e:
         chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":str(e)}])
-        return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+        preview, paths, idx = _safe_last([])
+        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
     except Exception as e:
         msg = f"Error: {e}"
         chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
-        return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+        preview, paths, idx = _safe_last([])
+        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
 
     report_fp = write_report(sections)
     zip_fp = save_zip()
-    preview = images[-1] if images else None
-    return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview
+    preview, paths, idx = _safe_last(image_paths)
+    return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx
 
 # ---------- UI ----------
 with gr.Blocks(title="SpatChat: Stats Room") as demo:
@@ -1044,16 +1079,41 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
             user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., I want a t-test on score by sex", lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
-            preview_plot = gr.Image(label="Preview (last figure)", value=None)
+            preview_plot = gr.Image(label="Preview (last figure)", value=None, type="filepath")
             data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
             download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False)
+
+            with gr.Row():
+                prev_btn = gr.Button("◀️ Prev", variant="secondary")
+                next_btn = gr.Button("Next ▶️", variant="secondary")
+
+            # Gallery states
+            gallery_paths = gr.State([])
+            gallery_index = gr.State(-1)
 
     # Enable queue (older-Gradio-safe signature)
     demo.queue(max_size=16)
 
     file_input.change(handle_upload, inputs=file_input, outputs=[chatbot, data_preview, download_btn])
-    user_input.submit(handle_chat, inputs=[chatbot, user_input, data_preview], outputs=[chatbot, preview_plot, download_btn, data_preview])
+
+    user_input.submit(
+        handle_chat,
+        inputs=[chatbot, user_input, data_preview],
+        outputs=[chatbot, preview_plot, download_btn, data_preview, gallery_paths, gallery_index]
+    )
     user_input.submit(lambda *args: "", inputs=None, outputs=user_input)
+
+    # Button callbacks
+    def on_prev(paths, idx):
+        preview, new_idx = _step(paths, idx, -1)
+        return gr.update(value=preview), new_idx
+
+    def on_next(paths, idx):
+        preview, new_idx = _step(paths, idx, +1)
+        return gr.update(value=preview), new_idx
+
+    prev_btn.click(on_prev, inputs=[gallery_paths, gallery_index], outputs=[preview_plot, gallery_index])
+    next_btn.click(on_next, inputs=[gallery_paths, gallery_index], outputs=[preview_plot, gallery_index])
 
 if __name__ == "__main__":
     demo.launch(ssr_mode=False)
