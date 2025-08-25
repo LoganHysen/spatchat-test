@@ -423,6 +423,31 @@ def ordered_groups(df: pd.DataFrame, group_col: str) -> List[str]:
     except Exception:
         return sorted(vals, key=lambda x: (str(x).lower(), str(x)))
 
+# ---------- NEW: NULL-LIKE SANITIZATION ----------
+NULLY_STRINGS = {"", "null", "none", "na", "n/a", "nil"}
+
+def clean_null_like(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    return None if s in NULLY_STRINGS else v
+
+def sanitize_args(action: Optional[str], args: Dict) -> Dict:
+    """Normalize any 'group'/'by' keys so 'null'/'none'/'' → None."""
+    if not isinstance(args, dict):
+        return {}
+    if action == "summary":
+        args["by"] = clean_null_like(args.get("by"))
+    elif action in {"ttest", "anova"}:
+        args["group"] = clean_null_like(args.get("group"))
+        # leave 'value' as-is
+    elif action == "plot":
+        for k in ("box", "violin", "bar"):
+            if k in args and isinstance(args[k], dict):
+                args[k]["group"] = clean_null_like(args[k].get("group"))
+    # for other actions, nothing special needed
+    return args
+
 # ---------- ANALYSES ----------
 def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=False, paired=False) -> str:
     if paired:
@@ -801,7 +826,7 @@ def handle_chat(chat_history, user_message, data_preview):
         return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
 
     action = parsed.get("action")
-    args = parsed.get("args", {})
+    args = sanitize_args(action, parsed.get("args", {}))  # <---- NEW: sanitize 'null'-like args
 
     if cached_df is None:
         chat_history.append({"role":"assistant","content":"Please upload a CSV first."})
@@ -824,10 +849,11 @@ def handle_chat(chat_history, user_message, data_preview):
         # -------- Summary --------
         if action == "summary":
             col = args.get("col")
-            by = args.get("by")
+            by = args.get("by")  # already sanitized to None if null-like
             if col not in df.columns:
                 raise gr.Error(f"Column '{col}' not found.")
-            if by and by not in df.columns:
+            # Only error if a REAL non-null-like group was supplied but doesn't exist
+            if by is not None and by not in df.columns:
                 raise gr.Error(f"Group column '{by}' not found.")
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
@@ -838,7 +864,7 @@ def handle_chat(chat_history, user_message, data_preview):
         # -------- t-test --------
         if action == "ttest":
             value = args.get("value")
-            group = args.get("group")
+            group = args.get("group")  # sanitized
             if not value or not group:
                 nums, groups = need_value_and_group(df)
                 pending.update({"action":"ttest","need":"value" if not value else "group","args":{"value":value,"group":group}})
@@ -857,7 +883,8 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- ANOVA --------
         elif action == "anova":
-            value = args.get("value"); group = args.get("group")
+            value = args.get("value")
+            group = args.get("group")  # sanitized
             if not value or not group:
                 nums, groups = need_value_and_group(df)
                 pending.update({"action":"anova","need":"value" if not value else "group","args":{"value":value,"group":group}})
@@ -906,26 +933,44 @@ def handle_chat(chat_history, user_message, data_preview):
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
             if "box" in args:
                 p = args["box"]
-                if p.get("value") == p.get("group"):
+                grp = p.get("group")
+                if grp is None:
+                    nums, groups = need_value_and_group(df)
+                    ask = "Which group column for the box plot? Candidates: " + ", ".join(groups)
+                    chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                    return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                if p.get("value") == grp:
                     raise gr.Error("Outcome and group must be different.")
-                title, im = plot_box(df, p.get("value"), p.get("group"))
-                images.append(im); save_image_np(im, f"plot_box_{p.get('value')}_{p.get('group')}.png"); sections.append((title, "", im))
+                title, im = plot_box(df, p.get("value"), grp)
+                images.append(im); save_image_np(im, f"plot_box_{p.get('value')}_{grp}.png"); sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
             if "violin" in args:
                 p = args["violin"]
-                if p.get("value") == p.get("group"):
+                grp = p.get("group")
+                if grp is None:
+                    nums, groups = need_value_and_group(df)
+                    ask = "Which group column for the violin plot? Candidates: " + ", ".join(groups)
+                    chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                    return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                if p.get("value") == grp:
                     raise gr.Error("Outcome and group must be different.")
-                title, im = plot_violin(df, p.get("value"), p.get("group"))
-                images.append(im); save_image_np(im, f"plot_violin_{p.get('value')}_{p.get('group')}.png"); sections.append((title, "", im))
+                title, im = plot_violin(df, p.get("value"), grp)
+                images.append(im); save_image_np(im, f"plot_violin_{p.get('value')}_{grp}.png"); sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
             if "bar" in args:
                 p = args["bar"]
-                if p.get("value") == p.get("group"):
+                grp = p.get("group")
+                if grp is None:
+                    nums, groups = need_value_and_group(df)
+                    ask = "Which group column for the bar chart? Candidates: " + ", ".join(groups)
+                    chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                    return chat_history, gr.update(value=None), gr.update(value=None, visible=False), data_preview
+                if p.get("value") == grp:
                     raise gr.Error("Outcome and group must be different.")
                 err = p.get("error","sem")
-                gorder = ordered_groups(df, p.get("group"))
-                im = bar_with_error_plot(df, p.get("value"), p.get("group"), error=err, gorder=gorder)
-                images.append(im); save_image_np(im, f"plot_bar_{p.get('value')}_{p.get('group')}_{err}.png"); sections.append((f"Bar {p.get('value')}~{p.get('group')}", "", im))
+                gorder = ordered_groups(df, grp)
+                im = bar_with_error_plot(df, p.get("value"), grp, error=err, gorder=gorder)
+                images.append(im); save_image_np(im, f"plot_bar_{p.get('value')}_{grp}_{err}.png"); sections.append((f"Bar {p.get('value')}~{grp}", "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"Bar ± {err.upper()} generated."}])
 
         # -------- CHECKS --------
@@ -934,19 +979,6 @@ def handle_chat(chat_history, user_message, data_preview):
                 p = args["normality"]; msg, im = check_normality(df, p.get("col"))
                 images.append(im); save_image_np(im, f"plot_qq_{p.get('col')}.png")
                 sections.append(("Normality", msg, im))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
-
-        # -------- POWER --------
-        elif action == "power":
-            if "ttest_ind" in args:
-                p = args["ttest_ind"]
-                msg = power_ttest_ind(p.get("effect_size",0.5), float(p.get("alpha",0.05)), p.get("power",0.8), float(p.get("ratio",1.0)), p.get("solve_for","n_total"))
-                sections.append(("Power – t-test (ind)", msg, None))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
-            if "anova_oneway" in args:
-                p = args["anova_oneway"]
-                msg = power_anova_oneway(p.get("effect_size",0.25), int(p.get("k_groups",3)), float(p.get("alpha",0.05)), p.get("power",0.8), p.get("solve_for","n_per_group"))
-                sections.append(("Power – ANOVA (one-way)", msg, None))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
 
         else:
