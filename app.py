@@ -206,6 +206,11 @@ FALLBACK_PROMPT = """
 You are SpatChat, a concise statistics tutor. If you can't map to a tool call, answer naturally in <=3 sentences.
 """.strip()
 
+# ---------- CHAT RENDERING HELP ----------
+def _fence(text: str) -> str:
+    """Wrap multi-line stats text to prevent Markdown table parsing in the chat UI."""
+    return f"```text\n{text}\n```"
+
 # ---------- PLOTTING HELPERS ----------
 def fig_to_np(fig: plt.Figure) -> np.ndarray:
     buf = io.BytesIO()
@@ -1311,7 +1316,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 raise gr.Error(f"Group column '{by}' not found.")
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(msg)}])
             report_fp = write_report(sections); zip_fp = save_zip()
             preview, paths, idx = _safe_last([])
             return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx
@@ -1332,7 +1337,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("t-test", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"ttest_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- ANOVA --------
         elif action == "anova":
@@ -1352,7 +1357,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("ANOVA", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"anova_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- POSTHOC: TUKEY --------
         elif action == "posthoc_tukey":
@@ -1368,7 +1373,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Post-hoc: Tukey HSD", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"tukey_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- KRUSKAL --------
         elif action == "kruskal":
@@ -1384,7 +1389,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Kruskal–Wallis", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"kruskal_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- POSTHOC: DUNN --------
         elif action == "posthoc_dunn":
@@ -1398,7 +1403,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
             txt, imgs = dunn_posthoc(df, value=value, group=group, p_adjust=padj)
             sections.append(("Post-hoc: Dunn’s", txt, None))
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- CHI-SQUARE / FISHER --------
         elif action == "chisq":
@@ -1413,17 +1418,17 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Chi-square / Fisher", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"chisq_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- CORRELATION --------
         elif action == "corr":
             if bool(args.get("matrix", False)):
                 method = args.get("method","pearson")
-                cols = args.get("cols")
-                txt, imgs = corr_matrix_plot(df, cols=cols, method=method)
+                txt, imgs = corr_matrix_plot(df, cols=args.get("cols"), method=method)
                 sections.append(("Correlation matrix", txt, None))
                 for i, im in enumerate(imgs):
                     pth = save_image_np(im, f"corr_matrix_{method}_{i+1}.png"); image_paths.append(pth)
+                # Keep chat concise for large matrices:
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":"Correlation matrix generated."}])
             else:
                 x = args.get("x"); y = args.get("y"); method = args.get("method","pearson")
@@ -1437,7 +1442,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 sections.append(("Correlation", txt, None))
                 for i, im in enumerate(imgs):
                     pth = save_image_np(im, f"corr_pair_{method}_{i+1}.png"); image_paths.append(pth)
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- PARTIAL CORRELATION --------
         elif action == "pcorr":
@@ -1452,7 +1457,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Partial correlation", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"pcorr_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- POINT-BISERIAL --------
         elif action == "pbiserial":
@@ -1468,7 +1473,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Point-biserial correlation", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"pbiserial_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- MANN–WHITNEY --------
         elif action == "mwutest":
@@ -1484,7 +1489,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Mann–Whitney U", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"mwutest_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- WILCOXON SIGNED-RANK --------
         elif action == "wilcoxon":
@@ -1499,7 +1504,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Wilcoxon signed-rank", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"wilcoxon_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- LEVENE --------
         elif action == "levene":
@@ -1513,7 +1518,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
             txt, imgs = levene_test(df, value=value, group=group, center=center)
             sections.append(("Levene’s test", txt, None))
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- OLS --------
         elif action == "ols":
@@ -1527,7 +1532,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("OLS", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"ols_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- GLM --------
         elif action == "glm":
@@ -1541,7 +1546,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append((f"GLM ({family})", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"glm_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
 
         # -------- PLOTS --------
         elif action == "plot":
@@ -1601,7 +1606,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 p = args["normality"]; msg, im = check_normality(df, p.get("col"))
                 pth = save_image_np(im, f"plot_qq_{p.get('col')}.png"); image_paths.append(pth)
                 sections.append(("Normality", msg, im))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(msg)}])
 
         # -------- POWER --------
         elif action == "power":
@@ -1609,12 +1614,12 @@ def handle_chat(chat_history, user_message, data_preview):
                 p = args["ttest_ind"]
                 msg = power_ttest_ind(p.get("effect_size",0.5), float(p.get("alpha",0.05)), p.get("power",0.8), float(p.get("ratio",1.0)), p.get("solve_for","n_total"))
                 sections.append(("Power – t-test (ind)", msg, None))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(msg)}])
             if "anova_oneway" in args:
                 p = args["anova_oneway"]
                 msg = power_anova_oneway(p.get("effect_size",0.25), int(p.get("k_groups",3)), float(p.get("alpha",0.05)), p.get("power",0.8), p.get("solve_for","n_per_group"))
                 sections.append(("Power – ANOVA (one-way)", msg, None))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(msg)}])
 
         else:
             msg = clarify_message(df, llm_error_text, text)
@@ -1680,6 +1685,7 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 label="SpatChat",
                 show_label=True,
                 type="messages",
+                # keep Markdown enabled so bullets render nicely; code-fencing handles stats blocks
                 value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test, ANOVA (+Tukey), Kruskal (+Dunn), correlations (Pearson/Spearman), partial/pbiserial, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Levene’s, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'."}]
             )
             user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., Tukey HSD score by group", lines=1)
