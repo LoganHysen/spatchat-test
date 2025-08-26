@@ -27,7 +27,7 @@ import statsmodels.formula.api as smf
 from statsmodels.stats.power import TTestIndPower, FTestAnovaPower
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
 
-# Optional: Dunn's test (if installed)
+# Optional: Dunn's test
 try:
     import scikit_posthocs as sp
 except Exception:
@@ -40,7 +40,7 @@ cached_df: Optional[pd.DataFrame] = None
 outputs_dir = "outputs"
 os.makedirs(outputs_dir, exist_ok=True)
 
-# Track if we asked a follow-up (e.g., “which outcome?”)
+# Track if we asked a follow-up
 pending: Dict[str, Optional[str]] = {"action": None, "need": None, "args": None}
 
 # ---------- LLM (HF primary, Together fallback) ----------
@@ -178,9 +178,9 @@ When the user asks for an analysis, respond ONLY in compact JSON using this sche
 Actions and args:
 - ttest: {"value":"colY","group":"colG", "paired": false, "equal_var": false}
 - anova: {"value":"colY","group":"colG"}
-- posthoc_tukey: {"value":"colY","group":"colG"}        # Tukey HSD after ANOVA
+- posthoc_tukey: {"value":"colY","group":"colG"}
 - kruskal: {"value":"colY","group":"colG"}
-- posthoc_dunn: {"value":"colY","group":"colG","p_adjust":"holm"}   # Dunn’s after Kruskal
+- posthoc_dunn: {"value":"colY","group":"colG","p_adjust":"holm"}
 - ols: {"formula":"y ~ x1 + x2"}
 - glm: {"formula":"y ~ x1 + x2", "family":"gaussian|binomial|poisson|gamma"}
 - chisq: {"row":"catA","col":"catB","exact": false}
@@ -571,8 +571,7 @@ def run_ols(df: pd.DataFrame, formula: str) -> Tuple[str, List[np.ndarray]]:
         order = np.argsort(x.values)
         fig, ax = plt.subplots(figsize=(6,3))
         ax.scatter(x, y)
-        m, b = np.polyfit(x.values[order], model.fittedvalues.values[order], 1)
-        ax.plot(x.values[order], m*x.values[order] + b)
+        ax.plot(x.values[order], model.fittedvalues.values[order])
         ax.set_xlabel(terms[0]); ax.set_ylabel(lhs); ax.set_title("Scatter + OLS fit")
         images.append(fig_to_np(fig))
 
@@ -679,9 +678,8 @@ def corr_pair(df: pd.DataFrame, x: str, y: str, method: str="pearson") -> Tuple[
     fig, ax = plt.subplots(figsize=(6,3))
     ax.scatter(s[x], s[y])
     if method.lower() == "pearson" and len(s) >= 2:
-        m, b = np.polyfit(s[x].values, s[y].values, 1)
-        xs = np.linspace(s[x].min(), s[x].max(), 100)
-        ax.plot(xs, m*xs + b)
+        order = np.argsort(s[x].values)
+        ax.plot(s[x].values[order], np.poly1d(np.polyfit(s[x].values, s[y].values, 1))(s[x].values)[order])
     ax.set_xlabel(x); ax.set_ylabel(y); ax.set_title(f"{method.title()} scatter")
     img = fig_to_np(fig)
     return "\n".join(lines), [img]
@@ -782,7 +780,6 @@ def tukey_hsd(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.nd
     d = df[[value, group]].dropna()
     d = d.astype({value: float})
     res = pairwise_tukeyhsd(endog=d[value].values, groups=d[group].astype(str).values, alpha=0.05)
-    # Save table
     summ = res.summary()
     data = summ.data[1:]  # skip header
     cols = [c.strip() for c in summ.data[0]]
@@ -819,7 +816,6 @@ def _holm_adjust(pvals: List[float]) -> List[float]:
         adj_i = min(1.0, max(adj_i, prev))
         adj[i] = adj_i
         prev = adj_i
-    # ensure monotonic non-decreasing when mapping back
     return adj.tolist()
 
 def dunn_posthoc(df: pd.DataFrame, value: str, group: str, p_adjust: str="holm") -> Tuple[str, List[np.ndarray]]:
@@ -830,7 +826,7 @@ def dunn_posthoc(df: pd.DataFrame, value: str, group: str, p_adjust: str="holm")
         ptab.to_csv(os.path.join(outputs_dir, f"dunn_{p_adjust}_pvalues.csv"))
         txt = f"Dunn’s post-hoc (p-adjust={p_adjust}) after Kruskal–Wallis\n" + ptab.round(4).to_string()
         return txt, []
-    # Fallback: pairwise Mann–Whitney + Holm adjust (approximation)
+    # Fallback: pairwise Mann–Whitney + Holm adjust
     levels = ordered_groups(d, group)
     from itertools import combinations
     pairs, raw_p = [], []
@@ -851,13 +847,10 @@ def dunn_posthoc(df: pd.DataFrame, value: str, group: str, p_adjust: str="holm")
         for i in range(len(raw_p)):
             if finite_mask[i]:
                 adj_p[i] = adj_vals[j]; j += 1
-    # Make table
-    rows = []
-    for (a,b), p, pa in zip(pairs, raw_p, adj_p):
-        rows.append({"group1":a, "group2":b, "p_raw":p, "p_adj_holm":pa})
+    rows = [{"group1":a, "group2":b, "p_raw":p, "p_adj_holm":pa} for (a,b), p, pa in zip(pairs, raw_p, adj_p)]
     out = pd.DataFrame(rows)
     out.to_csv(os.path.join(outputs_dir, "dunn_fallback_mwu_holm.csv"), index=False)
-    txt = "Dunn’s post-hoc (approx via pairwise Mann–Whitney + Holm adjustment; install scikit-posthocs for exact Dunn)\n" + out.round(4).to_string(index=False)
+    txt = "Dunn’s post-hoc (approx via pairwise Mann–Whitney + Holm; install scikit-posthocs for exact Dunn)\n" + out.round(4).to_string(index=False)
     return txt, []
 
 # ---------- PARTIAL & POINT-BISERIAL ----------
@@ -867,17 +860,14 @@ def partial_corr(df: pd.DataFrame, x: str, y: str, controls: List[str], method: 
     if len(d) < (len(controls) + 3):
         raise gr.Error("Not enough rows for partial correlation (need > controls + 2).")
     if method.lower() == "spearman":
-        # rank-transform first
         for c in cols:
             d[c] = d[c].rank(method="average")
-    # residualize x and y on controls via OLS
     Xc = sm.add_constant(d[controls])
     rx = sm.OLS(d[x].astype(float), Xc).fit().resid
     ry = sm.OLS(d[y].astype(float), Xc).fit().resid
     r, p = stats.pearsonr(rx, ry)
     n = len(d)
     k = len(controls)
-    # Fisher z CI using n-k-3 in denominator for se of z (equiv to df = n-k-2 for t)
     ci = pearson_ci(r, n - k)
     lines = [
         f"Partial correlation ({method.title()}) between {x} and {y} controlling for {', '.join(controls)}",
@@ -885,7 +875,6 @@ def partial_corr(df: pd.DataFrame, x: str, y: str, controls: List[str], method: 
     ]
     if not np.isnan(ci[0]):
         lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
-    # Scatter of residuals
     fig, ax = plt.subplots(figsize=(6,3))
     ax.scatter(rx, ry)
     m, b = np.polyfit(rx, ry, 1)
@@ -896,10 +885,8 @@ def partial_corr(df: pd.DataFrame, x: str, y: str, controls: List[str], method: 
     return "\n".join(lines), [img]
 
 def point_biserial(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
-    # Map group to 0/1 if needed
     g = df[group]
     if pd.api.types.is_numeric_dtype(g):
-        # if not binary unique, try cast to int and check
         uniq = pd.unique(g.dropna())
         if len(uniq) != 2:
             raise gr.Error(f"{group} must have exactly two distinct values for point-biserial.")
@@ -916,13 +903,11 @@ def point_biserial(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[
     try:
         r, p = stats.pointbiserialr(d["_gb"].values, d[value].astype(float).values)
     except Exception:
-        # Fallback is just Pearson with binary predictor
         r, p = stats.pearsonr(d["_gb"].values, d[value].astype(float).values)
     ci = pearson_ci(r, len(d))
     lines = [f"Point-biserial correlation between {value} and {group}", f"n={len(d)}, r = {r:.4g}, p = {p:.5g}"]
     if not np.isnan(ci[0]):
         lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
-    # Box + bar plots
     gorder = ordered_groups(df, group)
     title, img_box = plot_box(df, value, group)
     img_bar = bar_with_error_plot(df, value, group, error="sem", gorder=gorder)
@@ -977,7 +962,8 @@ def bar_with_error_plot(df: pd.DataFrame, value: str, group: str, error: str = "
     fig, ax = plt.subplots(figsize=(6,3))
     ax.bar(x, means, yerr=errs, capsize=4)
     ax.set_xticks(x); ax.set_xticklabels(gorder)
-    ax.set_title(f"Bar ± {error.UPPER() if hasattr(error,'upper') else str(error).upper()} of {value} by {group}")
+    err_label = str(error).upper()
+    ax.set_title(f"Bar ± {err_label} of {value} by {group}")
     return fig_to_np(fig)
 
 def check_normality(df: pd.DataFrame, col: str) -> Tuple[str, np.ndarray]:
@@ -1006,8 +992,13 @@ def power_ttest_ind(effect_size: Optional[float], alpha: float, power: Optional[
 def power_anova_oneway(effect_size: Optional[float], k_groups: int, alpha: float, power: Optional[float], solve_for: str) -> str:
     tool = FTestAnovaPower()
     if solve_for == "n_per_group":
-        n = tool.solve_power(effect_size=effect_size, k_groups=k_groups, alpha=alpha, power=power)
-        return f"Required n per group (one-way ANOVA): ≈ {int(np.ceil(n))}"
+        n_total = tool.solve_power(effect_size=effect_size, k_groups=k_groups, alpha=alpha, power=power)
+        n_per_group = int(np.ceil(n_total / k_groups))
+        n_total = int(np.ceil(n_total))
+        return (
+            f"Required sample size (one-way ANOVA): total ≈ {n_total}, "
+            f"per group ≈ {n_per_group} (k={k_groups}, f={effect_size}, α={alpha}, power={power})"
+        )
     elif solve_for == "power":
         pw = tool.solve_power(effect_size=effect_size, k_groups=k_groups, alpha=alpha, nobs=power)
         return f"Achieved power ≈ {pw:.3f}"
@@ -1050,7 +1041,6 @@ def ask_llm(chat_history, user_input):
 def _split_controls(s: str) -> List[str]:
     if not s:
         return []
-    # split on commas or plus signs
     parts = re.split(r"[,+]", s)
     return [p.strip() for p in parts if p.strip()]
 
@@ -1104,7 +1094,7 @@ def local_parse(user_input: str) -> Optional[Dict]:
     if re.search(r"(corr(?:elation)?\s*(matrix|heat\s*map|heatmap))", s):
         return {"tool":"stats","action":"corr","args":{"matrix":True, "method":"pearson"}}
 
-    # Partial correlation patterns
+    # Partial correlation
     m = re.search(r"(pcorr|partial\s+correlation).*?([a-zA-Z0-9_]+)\s*(?:and|&|,|vs|~)\s*([a-zA-Z0-9_]+)(?:.*?(?:\||controlling|adjusting|for)\s*([a-zA-Z0-9_\s\+,\.;:]+))?", s)
     if m:
         x, y = m.group(2), m.group(3)
@@ -1116,17 +1106,17 @@ def local_parse(user_input: str) -> Optional[Dict]:
     if m:
         return {"tool":"stats","action":"pbiserial","args":{"value":m.group(2), "group":m.group(3)}}
 
-    # Nonparametric rank-sum / Mann–Whitney
+    # Mann–Whitney
     m = re.search(r"(mann[\-\s]?whitney|wilcoxon\s*rank\s*sum|rank\s*test).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
         return {"tool":"stats","action":"mwutest","args":{"value":m.group(2), "group":m.group(3)}}
 
-    # Wilcoxon signed-rank (paired, two columns)
+    # Wilcoxon signed-rank (paired)
     m = re.search(r"(wilcoxon).*?([a-zA-Z0-9_]+)\s*(?:vs|and|,)\s*([a-zA-Z0-9_]+)", s)
     if m:
         return {"tool":"stats","action":"wilcoxon","args":{"a":m.group(2), "b":m.group(3)}}
 
-    # Levene’s test
+    # Levene
     m = re.search(r"(levene).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)(?:.*center\s*=\s*(median|mean|trimmed))?", s)
     if m:
         center = m.group(4) if m.group(4) else "median"
@@ -1410,7 +1400,7 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Post-hoc: Dunn’s", txt, None))
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
-        # -------- NEW: CHI-SQUARE / FISHER --------
+        # -------- CHI-SQUARE / FISHER --------
         elif action == "chisq":
             row = args.get("row"); col = args.get("col"); exact = bool(args.get("exact", False))
             if not row or not col:
@@ -1425,7 +1415,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 pth = save_image_np(im, f"chisq_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
-        # -------- NEW: CORRELATION --------
+        # -------- CORRELATION --------
         elif action == "corr":
             if bool(args.get("matrix", False)):
                 method = args.get("method","pearson")
@@ -1449,7 +1439,7 @@ def handle_chat(chat_history, user_message, data_preview):
                     pth = save_image_np(im, f"corr_pair_{method}_{i+1}.png"); image_paths.append(pth)
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
-        # -------- NEW: PARTIAL CORRELATION --------
+        # -------- PARTIAL CORRELATION --------
         elif action == "pcorr":
             x = args.get("x"); y = args.get("y"); ctrls = args.get("controls", []); method = args.get("method","pearson")
             if not x or not y or not ctrls:
@@ -1464,7 +1454,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 pth = save_image_np(im, f"pcorr_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
-        # -------- NEW: POINT-BISERIAL --------
+        # -------- POINT-BISERIAL --------
         elif action == "pbiserial":
             value = args.get("value"); group = args.get("group")
             if not value or not group:
@@ -1480,7 +1470,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 pth = save_image_np(im, f"pbiserial_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
-        # -------- NEW: MANN–WHITNEY --------
+        # -------- MANN–WHITNEY --------
         elif action == "mwutest":
             value = args.get("value"); group = args.get("group")
             if not value or not group:
@@ -1496,7 +1486,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 pth = save_image_np(im, f"mwutest_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
-        # -------- NEW: WILCOXON SIGNED-RANK --------
+        # -------- WILCOXON SIGNED-RANK --------
         elif action == "wilcoxon":
             a = args.get("a"); b = args.get("b")
             if not a or not b:
@@ -1511,7 +1501,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 pth = save_image_np(im, f"wilcoxon_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
-        # -------- NEW: LEVENE --------
+        # -------- LEVENE --------
         elif action == "levene":
             value = args.get("value"); group = args.get("group"); center = args.get("center","median")
             if not value or not group:
