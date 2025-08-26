@@ -25,6 +25,13 @@ from scipy import stats
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.power import TTestIndPower, FTestAnovaPower
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
+
+# Optional: Dunn's test (if installed)
+try:
+    import scikit_posthocs as sp
+except Exception:
+    sp = None
 
 print("Starting SpatChat: Stats Room (chat-first)")
 
@@ -166,22 +173,23 @@ llm = UnifiedLLM()
 SYSTEM_PROMPT = """
 You are SpatChat, an expert statistics assistant for basic analyses.
 When the user asks for an analysis, respond ONLY in compact JSON using this schema:
-{"tool":"stats","action":"ttest|anova|ols|glm|plot|check|power|summary|recommend|chisq|corr|mwutest|wilcoxon|kruskal|levene","args":{...}}
+{"tool":"stats","action":"ttest|anova|ols|glm|plot|check|power|summary|recommend|chisq|corr|mwutest|wilcoxon|kruskal|levene|posthoc_tukey|posthoc_dunn|pcorr|pbiserial","args":{...}}
 
 Actions and args:
 - ttest: {"value":"colY","group":"colG", "paired": false, "equal_var": false}
 - anova: {"value":"colY","group":"colG"}
+- posthoc_tukey: {"value":"colY","group":"colG"}        # Tukey HSD after ANOVA
+- kruskal: {"value":"colY","group":"colG"}
+- posthoc_dunn: {"value":"colY","group":"colG","p_adjust":"holm"}   # Dunn’s after Kruskal
 - ols: {"formula":"y ~ x1 + x2"}
 - glm: {"formula":"y ~ x1 + x2", "family":"gaussian|binomial|poisson|gamma"}
-
-- chisq: {"row":"catA","col":"catB","exact": false}   # Fisher's exact if exact=true and 2x2
+- chisq: {"row":"catA","col":"catB","exact": false}
 - corr:  {"x":"col1","y":"col2","method":"pearson|spearman","matrix": false, "cols": ["colA","colB", "..."]}
-
-- mwutest:  {"value":"colY","group":"colG"}          # Mann–Whitney (independent, 2 groups)
-- wilcoxon: {"a":"colA","b":"colB"}                  # Wilcoxon signed-rank (paired, 2 columns)
-- kruskal:  {"value":"colY","group":"colG"}          # Kruskal–Wallis (independent, 3+ groups)
-- levene:   {"value":"colY","group":"colG","center":"median|mean|trimmed"}
-
+- pcorr: {"x":"col1","y":"col2","controls":["c1","c2"],"method":"pearson|spearman"}
+- pbiserial: {"value":"numericCol","group":"binaryCol"}
+- mwutest: {"value":"colY","group":"colG"}
+- wilcoxon: {"a":"colA","b":"colB"}
+- levene: {"value":"colY","group":"colG","center":"median|mean|trimmed"}
 - plot: one of {"hist":{"col":"c","bins":30}, "box":{"value":"y","group":"g"}, "violin":{"value":"y","group":"g"}, "bar":{"value":"y","group":"g","error":"sem|sd|ci95"}}
 - check: {"normality":{"col":"y"}}
 - power: one of
@@ -368,20 +376,24 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
         rec_lines.append(f"• Compare average **{y_num}** between the two groups in **{g_bin}** (t-test).")
         rec_lines.append(f"• **Bar chart with error bars** for **{y_num}** by **{g_bin}**.")
         rec_lines.append(f"• **Mann–Whitney U** (rank-sum) for **{y_num}** by **{g_bin}** (nonparametric).")
+        rec_lines.append(f"• **Point-biserial** correlation of **{y_num}** with **{g_bin}**.")
+        rec_lines.append(f"• **Levene’s test** for equal variances across **{g_bin}**.")
     if y_num and g_multi:
         rec_lines.append(f"• Compare **{y_num}** across levels of **{g_multi}** (one-way ANOVA).")
+        rec_lines.append(f"• **Post-hoc Tukey HSD** for pairwise differences.")
         rec_lines.append(f"• **Kruskal–Wallis** across **{g_multi}** (nonparametric).")
+        rec_lines.append(f"• **Post-hoc Dunn’s test** with p-adjustment.")
         rec_lines.append(f"• **Box/violin plots** of **{y_num}** across **{g_multi}**.")
     if len(nums_safe) >= 2:
         rec_lines.append(f"• **Correlation**: Pearson or Spearman between **{nums_safe[0]}** and **{nums_safe[1]}**.")
         if len(nums_safe) >= 3:
             rec_lines.append(f"• **Correlation heatmap** for numeric columns.")
+        rec_lines.append(f"• **Partial correlation** between two variables controlling for others.")
         rec_lines.append(f"• See how one value predicts another (linear regression), e.g., **{nums_safe[0]} ~ {nums_safe[1]}**.")
     if len(cats) >= 2:
         rec_lines.append("• **Chi-square test** of association between two categorical columns.")
-    rec_lines.append("• **Normality check** with a QQ plot (assumption check).")
+    rec_lines.append("• **Normality check** with a QQ plot.")
     if g_bin:
-        rec_lines.append("• **Levene’s test** for equal variances across groups.")
         rec_lines.append("• **Power analysis** for a t-test to estimate sample size.")
     if g_multi:
         rec_lines.append("• **Power analysis** for one-way ANOVA to estimate sample size.")
@@ -393,15 +405,19 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
     if y_num and g_bin:
         ex.append(f'• "I want to do a t-test on {y_num} by {g_bin}."')
         ex.append(f'• "Mann-Whitney U test on {y_num} by {g_bin}."')
+        ex.append(f'• "Point-biserial correlation {y_num} by {g_bin}."')
         ex.append(f'• "Levene\'s test for {y_num} by {g_bin}."')
     if y_num and g_multi:
         ex.append(f'• "Run a one-way ANOVA of {y_num} by {g_multi}."')
+        ex.append(f'• "Tukey HSD for {y_num} by {g_multi}."')
         ex.append(f'• "Kruskal-Wallis on {y_num} by {g_multi}."')
+        ex.append(f'• "Dunn\'s post-hoc for {y_num} by {g_multi}."')
         ex.append(f'• "Show box and violin plots for {y_num} by {g_multi}."')
     if len(nums_safe) >= 2:
         ex.append(f'• "Pearson correlation between {nums_safe[0]} and {nums_safe[1]}."')
         ex.append(f'• "Spearman correlation {nums_safe[0]} vs {nums_safe[1]}."')
         ex.append('• "Correlation heatmap of numeric columns."')
+        ex.append('• "Partial correlation height and score controlling for age, weight."')
         ex.append(f'• "Fit a linear regression: {nums_safe[0]} ~ {nums_safe[1]}."')
     if len(cats) >= 2:
         ex.append('• "Chi-square test of sex by group."')
@@ -426,7 +442,7 @@ def ordered_groups(df: pd.DataFrame, group_col: str) -> List[str]:
     except Exception:
         return sorted(vals, key=lambda x: (str(x).lower(), str(x)))
 
-# ---------- NEW: NULL-LIKE SANITIZATION ----------
+# ---------- NULL-LIKE SANITIZATION ----------
 NULLY_STRINGS = {"", "null", "none", "na", "n/a", "nil"}
 
 def clean_null_like(v: Optional[str]) -> Optional[str]:
@@ -440,7 +456,7 @@ def sanitize_args(action: Optional[str], args: Dict) -> Dict:
         return {}
     if action == "summary":
         args["by"] = clean_null_like(args.get("by"))
-    elif action in {"ttest", "anova", "mwutest", "kruskal", "levene"}:
+    elif action in {"ttest", "anova", "mwutest", "kruskal", "levene", "posthoc_tukey", "posthoc_dunn", "pbiserial"}:
         args["group"] = clean_null_like(args.get("group"))
     elif action == "plot":
         for k in ("box", "violin", "bar"):
@@ -452,6 +468,11 @@ def sanitize_args(action: Optional[str], args: Dict) -> Dict:
     elif action == "corr":
         args["x"] = clean_null_like(args.get("x"))
         args["y"] = clean_null_like(args.get("y"))
+    elif action == "pcorr":
+        args["x"] = clean_null_like(args.get("x"))
+        args["y"] = clean_null_like(args.get("y"))
+        if isinstance(args.get("controls"), list):
+            args["controls"] = [c for c in args["controls"] if clean_null_like(c)]
     elif action == "wilcoxon":
         args["a"] = clean_null_like(args.get("a"))
         args["b"] = clean_null_like(args.get("b"))
@@ -601,13 +622,11 @@ def chisq_test(df: pd.DataFrame, row: str, col: str, exact: bool=False) -> Tuple
     else:
         chi2, p, dof, exp = stats.chi2_contingency(tab.values)
         method = f"Chi-square test (dof={dof})"
-    # Cramér's V
     r, c = tab.shape
     if r > 1 and c > 1 and not np.isnan(chi2):
         V = np.sqrt(chi2 / (n * (min(r-1, c-1))))
     else:
         V = np.nan
-
     lines = [
         f"{method} on {row} × {col}",
         f"Table (n={n}):",
@@ -617,7 +636,6 @@ def chisq_test(df: pd.DataFrame, row: str, col: str, exact: bool=False) -> Tuple
         lines.append(f"χ² = {chi2:.4g}, p = {p:.5g}, Cramér's V = {V:.3g}")
     else:
         lines.append(f"p = {p:.5g} (Fisher)")
-
     # Stacked bar plot (column proportions)
     fig, ax = plt.subplots(figsize=(6,3))
     cols = list(tab.columns)
@@ -633,7 +651,6 @@ def chisq_test(df: pd.DataFrame, row: str, col: str, exact: bool=False) -> Tuple
     ax.set_title(f"{row} proportions within {col}")
     ax.legend(fontsize=8, ncols=min(3, len(tab.index)))
     img = fig_to_np(fig)
-
     return "\n".join(lines), [img]
 
 def pearson_ci(r: float, n: int, alpha: float=0.05) -> Tuple[float, float]:
@@ -656,14 +673,9 @@ def corr_pair(df: pd.DataFrame, x: str, y: str, method: str="pearson") -> Tuple[
     else:
         corr, p = stats.pearsonr(s[x], s[y])
         ci = pearson_ci(corr, len(s))
-    lines = [
-        f"{method.title()} correlation between {x} and {y}",
-        f"n={len(s)}, r = {corr:.4g}, p = {p:.5g}",
-    ]
+    lines = [f"{method.title()} correlation between {x} and {y}", f"n={len(s)}, r = {corr:.4g}, p = {p:.5g}"]
     if not np.isnan(ci[0]):
         lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
-
-    # Scatter + line
     fig, ax = plt.subplots(figsize=(6,3))
     ax.scatter(s[x], s[y])
     if method.lower() == "pearson" and len(s) >= 2:
@@ -678,6 +690,7 @@ def corr_matrix_plot(df: pd.DataFrame, cols: Optional[List[str]]=None, method: s
     if cols is None or len(cols) < 2:
         cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     mat = df[cols].corr(method=method)
+    mat.to_csv(os.path.join(outputs_dir, f"corr_matrix_{method}.csv"))
     fig, ax = plt.subplots(figsize=(6,5))
     cax = ax.imshow(mat.values, aspect='auto')
     ax.set_xticks(np.arange(len(cols))); ax.set_xticklabels(cols, rotation=45, ha="right")
@@ -696,14 +709,13 @@ def mann_whitney(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np
     b = df[df[group].astype(str) == gorder[1]][value].dropna().astype(float).values
     U, p = stats.mannwhitneyu(a, b, alternative="two-sided")
     n1, n2 = len(a), len(b)
-    A = U/(n1*n2) if n1>0 and n2>0 else np.nan  # common-language
-    r_rb = 2*A - 1 if not np.isnan(A) else np.nan  # rank-biserial
+    A = U/(n1*n2) if n1>0 and n2>0 else np.nan
+    r_rb = 2*A - 1 if not np.isnan(A) else np.nan
     txt = [
         f"Mann–Whitney U on {value} by {group}",
         f"Groups: {gorder[0]} (n={n1}) vs {gorder[1]} (n={n2})",
         f"U = {U:.4g}, p = {p:.5g}, rank-biserial r = {r_rb:.3g} (A = {A:.3g})"
     ]
-    # Plots
     fig_box, ax = plt.subplots(figsize=(5,3))
     ax.boxplot([a, b], tick_labels=[gorder[0], gorder[1]])
     ax.set_title(f"Boxplot of {value} by {group}")
@@ -725,7 +737,6 @@ def wilcoxon_signed(df: pd.DataFrame, a: str, b: str) -> Tuple[str, List[np.ndar
         raise gr.Error("Wilcoxon signed-rank needs at least 3 paired observations.")
     stat, p = stats.wilcoxon(s[a], s[b], zero_method="wilcox", alternative="two-sided")
     txt = f"Wilcoxon signed-rank on paired columns {a} vs {b}\nn={len(s)}, W = {stat:.4g}, p = {p:.5g}"
-    # Paired scatter
     fig, ax = plt.subplots(figsize=(6,3))
     ax.scatter(s[a], s[b])
     lim = [min(s[a].min(), s[b].min()), max(s[a].max(), s[b].max())]
@@ -765,6 +776,157 @@ def levene_test(df: pd.DataFrame, value: str, group: str, center: str="median") 
     W, p = stats.levene(*data, center=center)
     txt = f"Levene’s test for equal variances on {value} by {group}\ncenter={center}, W = {W:.4g}, p = {p:.5g}"
     return txt, []
+
+# ---------- POST-HOC TESTS ----------
+def tukey_hsd(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
+    d = df[[value, group]].dropna()
+    d = d.astype({value: float})
+    res = pairwise_tukeyhsd(endog=d[value].values, groups=d[group].astype(str).values, alpha=0.05)
+    # Save table
+    summ = res.summary()
+    data = summ.data[1:]  # skip header
+    cols = [c.strip() for c in summ.data[0]]
+    tukey_df = pd.DataFrame(data, columns=cols)
+    tukey_df.to_csv(os.path.join(outputs_dir, "tukey_hsd_results.csv"), index=False)
+    # Means + 95% CI plot per group
+    gorder = ordered_groups(d, group)
+    means, ci_lo, ci_hi = [], [], []
+    for g in gorder:
+        vals = d[d[group].astype(str) == g][value].values
+        n = len(vals)
+        m = np.mean(vals) if n else np.nan
+        sd = np.std(vals, ddof=1) if n > 1 else np.nan
+        se = sd/np.sqrt(n) if n else np.nan
+        tcrit = stats.t.ppf(0.975, df=n-1) if n > 1 else np.nan
+        lo, hi = (m - tcrit*se, m + tcrit*se) if (se is not None and tcrit is not None) else (np.nan, np.nan)
+        means.append(m); ci_lo.append(lo); ci_hi.append(hi)
+    x = np.arange(len(gorder))
+    fig, ax = plt.subplots(figsize=(7,3))
+    ax.errorbar(x, means, yerr=[np.array(means)-np.array(ci_lo), np.array(ci_hi)-np.array(means)], fmt='o', capsize=5)
+    ax.set_xticks(x); ax.set_xticklabels(gorder)
+    ax.set_title(f"Tukey HSD (plot shows group means with 95% t-CIs)")
+    img = fig_to_np(fig)
+    txt = "Tukey HSD pairwise comparisons (α=0.05)\n" + tukey_df.to_string(index=False)
+    return txt, [img]
+
+def _holm_adjust(pvals: List[float]) -> List[float]:
+    m = len(pvals)
+    order = np.argsort(pvals)
+    adj = np.empty(m, dtype=float)
+    prev = 0.0
+    for rank, i in enumerate(order):
+        adj_i = (m - rank) * pvals[i]
+        adj_i = min(1.0, max(adj_i, prev))
+        adj[i] = adj_i
+        prev = adj_i
+    # ensure monotonic non-decreasing when mapping back
+    return adj.tolist()
+
+def dunn_posthoc(df: pd.DataFrame, value: str, group: str, p_adjust: str="holm") -> Tuple[str, List[np.ndarray]]:
+    d = df[[value, group]].dropna()
+    d = d.astype({value: float})
+    if sp is not None:
+        ptab = sp.posthoc_dunn(a=d, val_col=value, group_col=group, p_adjust=p_adjust)
+        ptab.to_csv(os.path.join(outputs_dir, f"dunn_{p_adjust}_pvalues.csv"))
+        txt = f"Dunn’s post-hoc (p-adjust={p_adjust}) after Kruskal–Wallis\n" + ptab.round(4).to_string()
+        return txt, []
+    # Fallback: pairwise Mann–Whitney + Holm adjust (approximation)
+    levels = ordered_groups(d, group)
+    from itertools import combinations
+    pairs, raw_p = [], []
+    for a, b in combinations(levels, 2):
+        va = d[d[group].astype(str) == a][value].values
+        vb = d[d[group].astype(str) == b][value].values
+        if len(va) == 0 or len(vb) == 0:
+            p = np.nan
+        else:
+            p = stats.mannwhitneyu(va, vb, alternative="two-sided").pvalue
+        pairs.append((a,b)); raw_p.append(p)
+    finite_mask = np.isfinite(raw_p)
+    adj_p = [np.nan]*len(raw_p)
+    if finite_mask.any():
+        finite_vals = [raw_p[i] for i in range(len(raw_p)) if finite_mask[i]]
+        adj_vals = _holm_adjust(finite_vals)
+        j = 0
+        for i in range(len(raw_p)):
+            if finite_mask[i]:
+                adj_p[i] = adj_vals[j]; j += 1
+    # Make table
+    rows = []
+    for (a,b), p, pa in zip(pairs, raw_p, adj_p):
+        rows.append({"group1":a, "group2":b, "p_raw":p, "p_adj_holm":pa})
+    out = pd.DataFrame(rows)
+    out.to_csv(os.path.join(outputs_dir, "dunn_fallback_mwu_holm.csv"), index=False)
+    txt = "Dunn’s post-hoc (approx via pairwise Mann–Whitney + Holm adjustment; install scikit-posthocs for exact Dunn)\n" + out.round(4).to_string(index=False)
+    return txt, []
+
+# ---------- PARTIAL & POINT-BISERIAL ----------
+def partial_corr(df: pd.DataFrame, x: str, y: str, controls: List[str], method: str="pearson") -> Tuple[str, List[np.ndarray]]:
+    cols = [x, y] + list(controls)
+    d = df[cols].dropna()
+    if len(d) < (len(controls) + 3):
+        raise gr.Error("Not enough rows for partial correlation (need > controls + 2).")
+    if method.lower() == "spearman":
+        # rank-transform first
+        for c in cols:
+            d[c] = d[c].rank(method="average")
+    # residualize x and y on controls via OLS
+    Xc = sm.add_constant(d[controls])
+    rx = sm.OLS(d[x].astype(float), Xc).fit().resid
+    ry = sm.OLS(d[y].astype(float), Xc).fit().resid
+    r, p = stats.pearsonr(rx, ry)
+    n = len(d)
+    k = len(controls)
+    # Fisher z CI using n-k-3 in denominator for se of z (equiv to df = n-k-2 for t)
+    ci = pearson_ci(r, n - k)
+    lines = [
+        f"Partial correlation ({method.title()}) between {x} and {y} controlling for {', '.join(controls)}",
+        f"n={n}, k={k} controls, r = {r:.4g}, p = {p:.5g}",
+    ]
+    if not np.isnan(ci[0]):
+        lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
+    # Scatter of residuals
+    fig, ax = plt.subplots(figsize=(6,3))
+    ax.scatter(rx, ry)
+    m, b = np.polyfit(rx, ry, 1)
+    xs = np.linspace(rx.min(), rx.max(), 100)
+    ax.plot(xs, m*xs + b)
+    ax.set_xlabel(f"{x} residuals"); ax.set_ylabel(f"{y} residuals"); ax.set_title("Partial correlation (residuals)")
+    img = fig_to_np(fig)
+    return "\n".join(lines), [img]
+
+def point_biserial(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
+    # Map group to 0/1 if needed
+    g = df[group]
+    if pd.api.types.is_numeric_dtype(g):
+        # if not binary unique, try cast to int and check
+        uniq = pd.unique(g.dropna())
+        if len(uniq) != 2:
+            raise gr.Error(f"{group} must have exactly two distinct values for point-biserial.")
+        gb = g.astype(float)
+    else:
+        levels = pd.unique(g.dropna())
+        if len(levels) != 2:
+            raise gr.Error(f"{group} must have exactly two levels for point-biserial.")
+        mapping = {str(levels[0]):0.0, str(levels[1]):1.0}
+        gb = g.astype(str).map(mapping)
+    d = pd.DataFrame({value: df[value], "_gb": gb}).dropna()
+    if len(d) < 3:
+        raise gr.Error("Not enough data for point-biserial.")
+    try:
+        r, p = stats.pointbiserialr(d["_gb"].values, d[value].astype(float).values)
+    except Exception:
+        # Fallback is just Pearson with binary predictor
+        r, p = stats.pearsonr(d["_gb"].values, d[value].astype(float).values)
+    ci = pearson_ci(r, len(d))
+    lines = [f"Point-biserial correlation between {value} and {group}", f"n={len(d)}, r = {r:.4g}, p = {p:.5g}"]
+    if not np.isnan(ci[0]):
+        lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
+    # Box + bar plots
+    gorder = ordered_groups(df, group)
+    title, img_box = plot_box(df, value, group)
+    img_bar = bar_with_error_plot(df, value, group, error="sem", gorder=gorder)
+    return "\n".join(lines), [img_bar, img_box]
 
 # ---------- PLOTS & CHECKS ----------
 def plot_hist(df: pd.DataFrame, col: str, bins: int = 30) -> Tuple[str, np.ndarray]:
@@ -811,12 +973,11 @@ def bar_with_error_plot(df: pd.DataFrame, value: str, group: str, error: str = "
             sd = vals.std(ddof=1) if n > 1 else np.nan
             e = sd/np.sqrt(n) if n > 0 else np.nan
         means.append(m); errs.append(e)
-
     x = np.arange(len(gorder))
     fig, ax = plt.subplots(figsize=(6,3))
     ax.bar(x, means, yerr=errs, capsize=4)
     ax.set_xticks(x); ax.set_xticklabels(gorder)
-    ax.set_title(f"Bar ± {error.upper()} of {value} by {group}")
+    ax.set_title(f"Bar ± {error.UPPER() if hasattr(error,'upper') else str(error).upper()} of {value} by {group}")
     return fig_to_np(fig)
 
 def check_normality(df: pd.DataFrame, col: str) -> Tuple[str, np.ndarray]:
@@ -886,6 +1047,13 @@ def ask_llm(chat_history, user_input):
         )
         return None, conv
 
+def _split_controls(s: str) -> List[str]:
+    if not s:
+        return []
+    # split on commas or plus signs
+    parts = re.split(r"[,+]", s)
+    return [p.strip() for p in parts if p.strip()]
+
 def local_parse(user_input: str) -> Optional[Dict]:
     s = user_input.strip().lower()
 
@@ -905,6 +1073,21 @@ def local_parse(user_input: str) -> Optional[Dict]:
     if m:
         return {"tool":"stats","action":"anova","args":{"value":m.group(2), "group":m.group(3)}}
 
+    # Post-hoc Tukey
+    m = re.search(r"(tukey|hsd|post[\-\s]*hoc).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
+    if m:
+        return {"tool":"stats","action":"posthoc_tukey","args":{"value":m.group(2), "group":m.group(3)}}
+
+    # Kruskal–Wallis
+    m = re.search(r"(kruskal|kw).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
+    if m:
+        return {"tool":"stats","action":"kruskal","args":{"value":m.group(2), "group":m.group(3)}}
+
+    # Post-hoc Dunn
+    m = re.search(r"(dunn).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
+    if m:
+        return {"tool":"stats","action":"posthoc_dunn","args":{"value":m.group(2), "group":m.group(3), "p_adjust":"holm"}}
+
     # Chi-square / Fisher
     m = re.search(r"(chi(?:-?square)?|chi2|chisq|fisher).*?(?:of|between|for)?\s*([a-zA-Z0-9_]+)\s*(?:by|x|vs|versus|and)\s*([a-zA-Z0-9_]+)", s)
     if m:
@@ -921,6 +1104,18 @@ def local_parse(user_input: str) -> Optional[Dict]:
     if re.search(r"(corr(?:elation)?\s*(matrix|heat\s*map|heatmap))", s):
         return {"tool":"stats","action":"corr","args":{"matrix":True, "method":"pearson"}}
 
+    # Partial correlation patterns
+    m = re.search(r"(pcorr|partial\s+correlation).*?([a-zA-Z0-9_]+)\s*(?:and|&|,|vs|~)\s*([a-zA-Z0-9_]+)(?:.*?(?:\||controlling|adjusting|for)\s*([a-zA-Z0-9_\s\+,\.;:]+))?", s)
+    if m:
+        x, y = m.group(2), m.group(3)
+        ctrls = _split_controls(m.group(4) or "")
+        return {"tool":"stats","action":"pcorr","args":{"x":x, "y":y, "controls":ctrls, "method":"pearson"}}
+
+    # Point-biserial
+    m = re.search(r"(point[\-\s]*biserial|pbiserial).*?(?:of|between|on)?\s*([a-zA-Z0-9_]+)\s*(?:by|with|and)\s*([a-zA-Z0-9_]+)", s)
+    if m:
+        return {"tool":"stats","action":"pbiserial","args":{"value":m.group(2), "group":m.group(3)}}
+
     # Nonparametric rank-sum / Mann–Whitney
     m = re.search(r"(mann[\-\s]?whitney|wilcoxon\s*rank\s*sum|rank\s*test).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
@@ -930,11 +1125,6 @@ def local_parse(user_input: str) -> Optional[Dict]:
     m = re.search(r"(wilcoxon).*?([a-zA-Z0-9_]+)\s*(?:vs|and|,)\s*([a-zA-Z0-9_]+)", s)
     if m:
         return {"tool":"stats","action":"wilcoxon","args":{"a":m.group(2), "b":m.group(3)}}
-
-    # Kruskal–Wallis
-    m = re.search(r"(kruskal|kw).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
-    if m:
-        return {"tool":"stats","action":"kruskal","args":{"value":m.group(2), "group":m.group(3)}}
 
     # Levene’s test
     m = re.search(r"(levene).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)(?:.*center\s*=\s*(median|mean|trimmed))?", s)
@@ -991,12 +1181,13 @@ def clarify_message(df: Optional[pd.DataFrame], llm_error_text: Optional[str], u
         "What is the average score?",
         "Show a histogram of height.",
         "I want to do a t-test on score by sex.",
+        "Kruskal-Wallis score by group.",
+        "Tukey HSD score by group.",
+        "Dunn's test score by group.",
         "Pearson correlation height and weight.",
-        "Chi-square test of sex by group.",
-        "Mann-Whitney U test score by sex.",
-        "Kruskal-Wallis on score by group.",
-        "Wilcoxon pre vs post (two columns).",
-        "Correlation heatmap of numeric columns.",
+        "Partial correlation height and score controlling for age, weight.",
+        "Point-biserial score by sex.",
+        "Chi-square sex by group.",
         "Check normality of score (QQ plot)."
     ]
     if df is not None:
@@ -1027,7 +1218,7 @@ def handle_upload(file):
         cols = ", ".join(map(str, df.columns))
         preview = df.head(200)
         return (
-            [{"role":"assistant","content":f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, hist/box/violin/bar, normality checks, power, quick summaries, correlations, chi-square, rank tests, or say 'what can I do with my data?'"}],
+            [{"role":"assistant","content":f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA (+ Tukey), Kruskal (+ Dunn), correlations/partial/pbiserial, chi-square/Fisher, rank tests, Levene’s, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'"}],
             gr.update(value=preview, visible=True),
             gr.update(visible=True)
         )
@@ -1173,6 +1364,52 @@ def handle_chat(chat_history, user_message, data_preview):
                 pth = save_image_np(im, f"anova_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
+        # -------- POSTHOC: TUKEY --------
+        elif action == "posthoc_tukey":
+            value = args.get("value"); group = args.get("group")
+            if not value or not group:
+                nums, groups = need_value_and_group(df)
+                ask = ("Which numeric outcome for Tukey? Candidates: " + ", ".join(nums)) if not value \
+                      else ("Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = tukey_hsd(df, value=value, group=group)
+            sections.append(("Post-hoc: Tukey HSD", txt, None))
+            for i, im in enumerate(imgs):
+                pth = save_image_np(im, f"tukey_plot_{i+1}.png"); image_paths.append(pth)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
+        # -------- KRUSKAL --------
+        elif action == "kruskal":
+            value = args.get("value"); group = args.get("group")
+            if not value or not group:
+                nums, groups = need_value_and_group(df)
+                ask = ("Which numeric outcome for Kruskal–Wallis? Candidates: " + ", ".join(nums)) if not value \
+                      else ("Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = kruskal_wallis(df, value=value, group=group)
+            sections.append(("Kruskal–Wallis", txt, None))
+            for i, im in enumerate(imgs):
+                pth = save_image_np(im, f"kruskal_plot_{i+1}.png"); image_paths.append(pth)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
+        # -------- POSTHOC: DUNN --------
+        elif action == "posthoc_dunn":
+            value = args.get("value"); group = args.get("group"); padj = args.get("p_adjust","holm")
+            if not value or not group:
+                nums, groups = need_value_and_group(df)
+                ask = ("Which numeric outcome for Dunn’s test? Candidates: " + ", ".join(nums)) if not value \
+                      else ("Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = dunn_posthoc(df, value=value, group=group, p_adjust=padj)
+            sections.append(("Post-hoc: Dunn’s", txt, None))
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
         # -------- NEW: CHI-SQUARE / FISHER --------
         elif action == "chisq":
             row = args.get("row"); col = args.get("col"); exact = bool(args.get("exact", False))
@@ -1212,6 +1449,37 @@ def handle_chat(chat_history, user_message, data_preview):
                     pth = save_image_np(im, f"corr_pair_{method}_{i+1}.png"); image_paths.append(pth)
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
+        # -------- NEW: PARTIAL CORRELATION --------
+        elif action == "pcorr":
+            x = args.get("x"); y = args.get("y"); ctrls = args.get("controls", []); method = args.get("method","pearson")
+            if not x or not y or not ctrls:
+                nums = usable_numeric_cols(df)
+                ask = "Specify: partial correlation <x> and <y> controlling for <a, b>. Numeric candidates: " + ", ".join(nums)
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = partial_corr(df, x=x, y=y, controls=ctrls, method=method)
+            sections.append(("Partial correlation", txt, None))
+            for i, im in enumerate(imgs):
+                pth = save_image_np(im, f"pcorr_plot_{i+1}.png"); image_paths.append(pth)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
+        # -------- NEW: POINT-BISERIAL --------
+        elif action == "pbiserial":
+            value = args.get("value"); group = args.get("group")
+            if not value or not group:
+                nums, groups = usable_numeric_cols(df), [c for c in df.columns if df[c].nunique(dropna=True)==2]
+                ask = ("Which numeric outcome for point-biserial? Candidates: " + ", ".join(nums)) if not value \
+                      else ("Which binary group? Candidates: " + ", ".join(groups))
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = point_biserial(df, value=value, group=group)
+            sections.append(("Point-biserial correlation", txt, None))
+            for i, im in enumerate(imgs):
+                pth = save_image_np(im, f"pbiserial_plot_{i+1}.png"); image_paths.append(pth)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
         # -------- NEW: MANN–WHITNEY --------
         elif action == "mwutest":
             value = args.get("value"); group = args.get("group")
@@ -1241,22 +1509,6 @@ def handle_chat(chat_history, user_message, data_preview):
             sections.append(("Wilcoxon signed-rank", txt, None))
             for i, im in enumerate(imgs):
                 pth = save_image_np(im, f"wilcoxon_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
-
-        # -------- NEW: KRUSKAL–WALLIS --------
-        elif action == "kruskal":
-            value = args.get("value"); group = args.get("group")
-            if not value or not group:
-                nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Kruskal–Wallis? Candidates: " + ", ".join(nums)) if not value \
-                      else ("Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
-                preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
-            txt, imgs = kruskal_wallis(df, value=value, group=group)
-            sections.append(("Kruskal–Wallis", txt, None))
-            for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"kruskal_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
         # -------- NEW: LEVENE --------
@@ -1351,7 +1603,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 im = bar_with_error_plot(df, p.get("value"), grp, error=err, gorder=gorder)
                 pth = save_image_np(im, f"plot_bar_{p.get('value')}_{grp}_{err}.png"); image_paths.append(pth)
                 sections.append((f"Bar {p.get('value')}~{grp}", "", im))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"Bar ± {err.upper()} generated."}])
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"Bar ± {str(err).upper()} generated."}])
 
         # -------- CHECKS --------
         elif action == "check":
@@ -1438,9 +1690,9 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 label="SpatChat",
                 show_label=True,
                 type="messages",
-                value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test, ANOVA, correlations, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Kruskal–Wallis, Levene’s, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'."}]
+                value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test, ANOVA (+Tukey), Kruskal (+Dunn), correlations (Pearson/Spearman), partial/pbiserial, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Levene’s, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'."}]
             )
-            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., Pearson correlation height and weight", lines=1)
+            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., Tukey HSD score by group", lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
             preview_plot = gr.Image(
