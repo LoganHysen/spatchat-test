@@ -43,21 +43,15 @@ HF_MODEL_DEFAULT = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 TOGETHER_MODEL_DEFAULT = "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"
 
 def _choice_content(choice):
-    """
-    Extract assistant text from HF/Together pydantic/dict choices.
-    Handles str or list-of-parts content.
-    """
     msg = getattr(choice, "message", None)
     if msg is None and isinstance(choice, dict):
         msg = choice.get("message")
-
     content = None
     if msg is not None:
         if isinstance(msg, dict):
             content = msg.get("content")
         else:
             content = getattr(msg, "content", None)
-
     if isinstance(content, list):
         parts = []
         for part in content:
@@ -66,7 +60,6 @@ def _choice_content(choice):
             elif isinstance(part, str):
                 parts.append(part)
         content = "".join(parts)
-
     return content or ""
 
 def _delta_text(delta):
@@ -75,7 +68,6 @@ def _delta_text(delta):
     return getattr(delta, "content", "")
 
 class _SpacedCallLimiter:
-    """Ensure at least `min_interval_seconds` between calls (process-wide)."""
     def __init__(self, min_interval_seconds: float):
         self.min_interval = float(min_interval_seconds)
         self._lock = threading.Lock()
@@ -89,27 +81,16 @@ class _SpacedCallLimiter:
             self._last = time.monotonic()
 
 class UnifiedLLM:
-    """
-    Primary: Hugging Face (Serverless or Endpoint via HF_ENDPOINT_URL)
-    Fallback: Together.ai (if TOGETHER_API_KEY set)
-    Returns plain string content.
-    """
     def __init__(self):
         hf_model_or_url = (os.getenv("HF_ENDPOINT_URL") or HF_MODEL_DEFAULT).strip()
         hf_token = (os.getenv("HF_TOKEN") or "").strip()
-
-        self.hf_client = InferenceClient(
-            model=hf_model_or_url,
-            token=hf_token,
-            timeout=300,
-        )
-
+        self.hf_client = InferenceClient(model=hf_model_or_url, token=hf_token, timeout=300)
         self.together = None
         self.together_model = (os.getenv("TOGETHER_MODEL") or TOGETHER_MODEL_DEFAULT).strip()
         tg_key = (os.getenv("TOGETHER_API_KEY") or "").strip()
         if tg_key:
             self.together = Together(api_key=tg_key)
-            self._tg_limiter = _SpacedCallLimiter(min_interval_seconds=100.0)  # ≈0.6 QPM
+            self._tg_limiter = _SpacedCallLimiter(min_interval_seconds=100.0)
 
     @staticmethod
     def _messages_to_prompt(messages):
@@ -146,11 +127,7 @@ class UnifiedLLM:
                 else:
                     prompt = self._messages_to_prompt(messages)
                     text = self.hf_client.text_generation(
-                        prompt,
-                        max_new_tokens=max_tokens,
-                        temperature=temperature,
-                        stream=False,
-                        return_full_text=False,
+                        prompt, max_new_tokens=max_tokens, temperature=temperature, stream=False, return_full_text=False
                     )
                     return text
             except Exception as e:
@@ -166,8 +143,6 @@ class UnifiedLLM:
             print(f"[LLM] HF primary failed: {hf_err}", file=sys.stderr)
             if self.together is None:
                 raise
-
-            # pace Together BEFORE first attempt
             self._tg_limiter.wait()
             backoff = 12.0
             for attempt in range(4):
@@ -191,20 +166,29 @@ llm = UnifiedLLM()
 SYSTEM_PROMPT = """
 You are SpatChat, an expert statistics assistant for basic analyses.
 When the user asks for an analysis, respond ONLY in compact JSON using this schema:
-{"tool":"stats","action":"ttest|anova|ols|glm|plot|check|power|summary|recommend","args":{...}}
+{"tool":"stats","action":"ttest|anova|ols|glm|plot|check|power|summary|recommend|chisq|corr|mwutest|wilcoxon|kruskal|levene","args":{...}}
 
 Actions and args:
 - ttest: {"value":"colY","group":"colG", "paired": false, "equal_var": false}
 - anova: {"value":"colY","group":"colG"}
 - ols: {"formula":"y ~ x1 + x2"}
 - glm: {"formula":"y ~ x1 + x2", "family":"gaussian|binomial|poisson|gamma"}
+
+- chisq: {"row":"catA","col":"catB","exact": false}   # Fisher's exact if exact=true and 2x2
+- corr:  {"x":"col1","y":"col2","method":"pearson|spearman","matrix": false, "cols": ["colA","colB", "..."]}
+
+- mwutest:  {"value":"colY","group":"colG"}          # Mann–Whitney (independent, 2 groups)
+- wilcoxon: {"a":"colA","b":"colB"}                  # Wilcoxon signed-rank (paired, 2 columns)
+- kruskal:  {"value":"colY","group":"colG"}          # Kruskal–Wallis (independent, 3+ groups)
+- levene:   {"value":"colY","group":"colG","center":"median|mean|trimmed"}
+
 - plot: one of {"hist":{"col":"c","bins":30}, "box":{"value":"y","group":"g"}, "violin":{"value":"y","group":"g"}, "bar":{"value":"y","group":"g","error":"sem|sd|ci95"}}
 - check: {"normality":{"col":"y"}}
 - power: one of
    {"ttest_ind": {"effect_size": 0.5, "alpha": 0.05, "power": 0.8, "ratio": 1.0, "solve_for":"n_total|power|effect_size"}}
    {"anova_oneway": {"effect_size": 0.25, "k_groups": 3, "alpha": 0.05, "power": 0.8, "solve_for":"n_per_group|power|effect_size"}}
-- summary: {"col":"y", "by":"group_col_or_null"}  # quick stats (mean/sd/min/max), optional by-group
-- recommend: {}  # dataset-aware suggestions
+- summary: {"col":"y", "by":"group_col_or_null"}
+- recommend: {}
 
 If unclear, pick sensible defaults from the dataset. NEVER include prose; JSON only.
 For general questions, answer in <=3 sentences of plain text.
@@ -383,13 +367,21 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
     if y_num and g_bin:
         rec_lines.append(f"• Compare average **{y_num}** between the two groups in **{g_bin}** (t-test).")
         rec_lines.append(f"• **Bar chart with error bars** for **{y_num}** by **{g_bin}**.")
+        rec_lines.append(f"• **Mann–Whitney U** (rank-sum) for **{y_num}** by **{g_bin}** (nonparametric).")
     if y_num and g_multi:
         rec_lines.append(f"• Compare **{y_num}** across levels of **{g_multi}** (one-way ANOVA).")
+        rec_lines.append(f"• **Kruskal–Wallis** across **{g_multi}** (nonparametric).")
         rec_lines.append(f"• **Box/violin plots** of **{y_num}** across **{g_multi}**.")
     if len(nums_safe) >= 2:
+        rec_lines.append(f"• **Correlation**: Pearson or Spearman between **{nums_safe[0]}** and **{nums_safe[1]}**.")
+        if len(nums_safe) >= 3:
+            rec_lines.append(f"• **Correlation heatmap** for numeric columns.")
         rec_lines.append(f"• See how one value predicts another (linear regression), e.g., **{nums_safe[0]} ~ {nums_safe[1]}**.")
+    if len(cats) >= 2:
+        rec_lines.append("• **Chi-square test** of association between two categorical columns.")
     rec_lines.append("• **Normality check** with a QQ plot (assumption check).")
     if g_bin:
+        rec_lines.append("• **Levene’s test** for equal variances across groups.")
         rec_lines.append("• **Power analysis** for a t-test to estimate sample size.")
     if g_multi:
         rec_lines.append("• **Power analysis** for one-way ANOVA to estimate sample size.")
@@ -400,11 +392,19 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
         ex.append(f'• "Show a histogram of {y_num}."')
     if y_num and g_bin:
         ex.append(f'• "I want to do a t-test on {y_num} by {g_bin}."')
+        ex.append(f'• "Mann-Whitney U test on {y_num} by {g_bin}."')
+        ex.append(f'• "Levene\'s test for {y_num} by {g_bin}."')
     if y_num and g_multi:
         ex.append(f'• "Run a one-way ANOVA of {y_num} by {g_multi}."')
+        ex.append(f'• "Kruskal-Wallis on {y_num} by {g_multi}."')
         ex.append(f'• "Show box and violin plots for {y_num} by {g_multi}."')
     if len(nums_safe) >= 2:
+        ex.append(f'• "Pearson correlation between {nums_safe[0]} and {nums_safe[1]}."')
+        ex.append(f'• "Spearman correlation {nums_safe[0]} vs {nums_safe[1]}."')
+        ex.append('• "Correlation heatmap of numeric columns."')
         ex.append(f'• "Fit a linear regression: {nums_safe[0]} ~ {nums_safe[1]}."')
+    if len(cats) >= 2:
+        ex.append('• "Chi-square test of sex by group."')
     ex.append('• "Check normality of the main outcome and show a QQ plot."')
     if g_bin:
         ex.append('• "Power analysis for a t-test with 80% power and effect size 0.5."')
@@ -436,17 +436,25 @@ def clean_null_like(v: Optional[str]) -> Optional[str]:
     return None if s in NULLY_STRINGS else v
 
 def sanitize_args(action: Optional[str], args: Dict) -> Dict:
-    """Normalize any 'group'/'by' keys so 'null'/'none'/'' → None."""
     if not isinstance(args, dict):
         return {}
     if action == "summary":
         args["by"] = clean_null_like(args.get("by"))
-    elif action in {"ttest", "anova"}:
+    elif action in {"ttest", "anova", "mwutest", "kruskal", "levene"}:
         args["group"] = clean_null_like(args.get("group"))
     elif action == "plot":
         for k in ("box", "violin", "bar"):
             if k in args and isinstance(args[k], dict):
                 args[k]["group"] = clean_null_like(args[k].get("group"))
+    elif action == "chisq":
+        args["row"] = clean_null_like(args.get("row"))
+        args["col"] = clean_null_like(args.get("col"))
+    elif action == "corr":
+        args["x"] = clean_null_like(args.get("x"))
+        args["y"] = clean_null_like(args.get("y"))
+    elif action == "wilcoxon":
+        args["a"] = clean_null_like(args.get("a"))
+        args["b"] = clean_null_like(args.get("b"))
     return args
 
 # ---------- ANALYSES ----------
@@ -461,7 +469,6 @@ def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=Fals
         va, vb = np.var(a, ddof=1), np.var(b, ddof=1)
         na, nb = len(a), len(b)
         df_est = (va/na + vb/nb)**2 / ((va**2)/((na**2)*(na-1)) + (vb**2)/((nb**2)*(nb-1)))
-
     mean_a, mean_b = a.mean(), b.mean()
     sd_a, sd_b = a.std(ddof=1), b.std(ddof=1)
     diff = mean_a - mean_b
@@ -471,12 +478,10 @@ def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=Fals
         ci_low, ci_high = diff - tcrit*se, diff + tcrit*se
     except Exception:
         ci_low = ci_high = np.nan
-
     sp = np.sqrt(((len(a)-1)*sd_a**2 + (len(b)-1)*sd_b**2) / (len(a)+len(b)-2)) if len(a)+len(b)-2 > 0 else np.nan
     d = diff / sp if sp and sp > 0 else np.nan
     J = 1 - (3 / (4*(len(a)+len(b)-2) - 1)) if (len(a)+len(b)-2) > 1 else 1.0
     g = d * J if d is not None else np.nan
-
     lines = [
         "t-test",
         test_name,
@@ -545,7 +550,8 @@ def run_ols(df: pd.DataFrame, formula: str) -> Tuple[str, List[np.ndarray]]:
         order = np.argsort(x.values)
         fig, ax = plt.subplots(figsize=(6,3))
         ax.scatter(x, y)
-        ax.plot(x.values[order], model.fittedvalues.values[order])
+        m, b = np.polyfit(x.values[order], model.fittedvalues.values[order], 1)
+        ax.plot(x.values[order], m*x.values[order] + b)
         ax.set_xlabel(terms[0]); ax.set_ylabel(lhs); ax.set_title("Scatter + OLS fit")
         images.append(fig_to_np(fig))
 
@@ -583,6 +589,182 @@ def run_glm(df: pd.DataFrame, formula: str, family: str) -> Tuple[str, List[np.n
     images.append(fig_to_np(plt.gcf()))
 
     return str(model.summary()), images
+
+# ---------- NEW ANALYSES ----------
+def chisq_test(df: pd.DataFrame, row: str, col: str, exact: bool=False) -> Tuple[str, List[np.ndarray]]:
+    tab = pd.crosstab(df[row], df[col], dropna=True)
+    n = tab.values.sum()
+    if tab.shape == (2,2) and exact:
+        oddsratio, p = stats.fisher_exact(tab.values)
+        method = "Fisher's exact (2x2)"
+        chi2 = np.nan
+    else:
+        chi2, p, dof, exp = stats.chi2_contingency(tab.values)
+        method = f"Chi-square test (dof={dof})"
+    # Cramér's V
+    r, c = tab.shape
+    if r > 1 and c > 1 and not np.isnan(chi2):
+        V = np.sqrt(chi2 / (n * (min(r-1, c-1))))
+    else:
+        V = np.nan
+
+    lines = [
+        f"{method} on {row} × {col}",
+        f"Table (n={n}):",
+        str(tab),
+    ]
+    if not np.isnan(chi2):
+        lines.append(f"χ² = {chi2:.4g}, p = {p:.5g}, Cramér's V = {V:.3g}")
+    else:
+        lines.append(f"p = {p:.5g} (Fisher)")
+
+    # Stacked bar plot (column proportions)
+    fig, ax = plt.subplots(figsize=(6,3))
+    cols = list(tab.columns)
+    ind = np.arange(len(cols))
+    bottom = np.zeros(len(cols))
+    for level in tab.index:
+        vals = tab.loc[level].values.astype(float)
+        props = vals / vals.sum() if vals.sum() > 0 else vals
+        ax.bar(ind, props, bottom=bottom, label=str(level))
+        bottom += props
+    ax.set_xticks(ind); ax.set_xticklabels(cols)
+    ax.set_ylabel("Proportion")
+    ax.set_title(f"{row} proportions within {col}")
+    ax.legend(fontsize=8, ncols=min(3, len(tab.index)))
+    img = fig_to_np(fig)
+
+    return "\n".join(lines), [img]
+
+def pearson_ci(r: float, n: int, alpha: float=0.05) -> Tuple[float, float]:
+    if n <= 3 or np.isclose(abs(r), 1.0):
+        return (np.nan, np.nan)
+    z = np.arctanh(r)
+    se = 1/np.sqrt(n-3)
+    zcrit = stats.norm.ppf(1 - alpha/2)
+    lo = np.tanh(z - zcrit*se)
+    hi = np.tanh(z + zcrit*se)
+    return lo, hi
+
+def corr_pair(df: pd.DataFrame, x: str, y: str, method: str="pearson") -> Tuple[str, List[np.ndarray]]:
+    s = df[[x,y]].dropna()
+    if len(s) < 2:
+        raise gr.Error("Not enough paired data for correlation.")
+    if method.lower() == "spearman":
+        corr, p = stats.spearmanr(s[x], s[y])
+        ci = (np.nan, np.nan)
+    else:
+        corr, p = stats.pearsonr(s[x], s[y])
+        ci = pearson_ci(corr, len(s))
+    lines = [
+        f"{method.title()} correlation between {x} and {y}",
+        f"n={len(s)}, r = {corr:.4g}, p = {p:.5g}",
+    ]
+    if not np.isnan(ci[0]):
+        lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
+
+    # Scatter + line
+    fig, ax = plt.subplots(figsize=(6,3))
+    ax.scatter(s[x], s[y])
+    if method.lower() == "pearson" and len(s) >= 2:
+        m, b = np.polyfit(s[x].values, s[y].values, 1)
+        xs = np.linspace(s[x].min(), s[x].max(), 100)
+        ax.plot(xs, m*xs + b)
+    ax.set_xlabel(x); ax.set_ylabel(y); ax.set_title(f"{method.title()} scatter")
+    img = fig_to_np(fig)
+    return "\n".join(lines), [img]
+
+def corr_matrix_plot(df: pd.DataFrame, cols: Optional[List[str]]=None, method: str="pearson") -> Tuple[str, List[np.ndarray]]:
+    if cols is None or len(cols) < 2:
+        cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    mat = df[cols].corr(method=method)
+    fig, ax = plt.subplots(figsize=(6,5))
+    cax = ax.imshow(mat.values, aspect='auto')
+    ax.set_xticks(np.arange(len(cols))); ax.set_xticklabels(cols, rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(cols))); ax.set_yticklabels(cols)
+    ax.set_title(f"{method.title()} correlation matrix")
+    fig.colorbar(cax, ax=ax, fraction=0.046, pad=0.04)
+    img = fig_to_np(fig)
+    txt = f"{method.title()} correlation matrix on: {', '.join(cols)}\n\n{mat.round(3).to_string()}"
+    return txt, [img]
+
+def mann_whitney(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
+    gorder = ordered_groups(df, group)
+    if len(gorder) != 2:
+        raise gr.Error(f"Mann–Whitney U requires exactly 2 groups; {group} has {len(gorder)} levels.")
+    a = df[df[group].astype(str) == gorder[0]][value].dropna().astype(float).values
+    b = df[df[group].astype(str) == gorder[1]][value].dropna().astype(float).values
+    U, p = stats.mannwhitneyu(a, b, alternative="two-sided")
+    n1, n2 = len(a), len(b)
+    A = U/(n1*n2) if n1>0 and n2>0 else np.nan  # common-language
+    r_rb = 2*A - 1 if not np.isnan(A) else np.nan  # rank-biserial
+    txt = [
+        f"Mann–Whitney U on {value} by {group}",
+        f"Groups: {gorder[0]} (n={n1}) vs {gorder[1]} (n={n2})",
+        f"U = {U:.4g}, p = {p:.5g}, rank-biserial r = {r_rb:.3g} (A = {A:.3g})"
+    ]
+    # Plots
+    fig_box, ax = plt.subplots(figsize=(5,3))
+    ax.boxplot([a, b], tick_labels=[gorder[0], gorder[1]])
+    ax.set_title(f"Boxplot of {value} by {group}")
+    img_box = fig_to_np(fig_box)
+
+    fig_vio, ax = plt.subplots(figsize=(5,3))
+    ax.violinplot([a, b], showmeans=True)
+    ax.set_xticks([1,2]); ax.set_xticklabels([gorder[0], gorder[1]])
+    ax.set_title(f"Violin of {value} by {group}")
+    img_vio = fig_to_np(fig_vio)
+
+    img_bar = bar_with_error_plot(df, value, group, error="sem", gorder=gorder)
+
+    return "\n".join(txt), [img_bar, img_box, img_vio]
+
+def wilcoxon_signed(df: pd.DataFrame, a: str, b: str) -> Tuple[str, List[np.ndarray]]:
+    s = df[[a,b]].dropna().astype(float)
+    if len(s) < 3:
+        raise gr.Error("Wilcoxon signed-rank needs at least 3 paired observations.")
+    stat, p = stats.wilcoxon(s[a], s[b], zero_method="wilcox", alternative="two-sided")
+    txt = f"Wilcoxon signed-rank on paired columns {a} vs {b}\nn={len(s)}, W = {stat:.4g}, p = {p:.5g}"
+    # Paired scatter
+    fig, ax = plt.subplots(figsize=(6,3))
+    ax.scatter(s[a], s[b])
+    lim = [min(s[a].min(), s[b].min()), max(s[a].max(), s[b].max())]
+    ax.plot(lim, lim, linestyle=":")
+    ax.set_xlabel(a); ax.set_ylabel(b); ax.set_title("Paired scatter (y=x reference)")
+    img = fig_to_np(fig)
+    return txt, [img]
+
+def kruskal_wallis(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
+    gorder = ordered_groups(df, group)
+    data = [df[df[group].astype(str) == g][value].dropna().astype(float).values for g in gorder]
+    if len(data) < 2:
+        raise gr.Error("Kruskal–Wallis requires at least two groups.")
+    H, p = stats.kruskal(*data)
+    n = sum(len(d) for d in data)
+    k = len(data)
+    eps2 = (H - k + 1) / (n - k) if n > k else np.nan
+    txt = f"Kruskal–Wallis on {value} by {group}\nGroups: {', '.join(gorder)}\nH = {H:.4g}, p = {p:.5g}, ε² = {eps2:.3g}"
+
+    fig_box, ax = plt.subplots(figsize=(6,3))
+    ax.boxplot(data, tick_labels=gorder)
+    ax.set_title(f"Boxplot of {value} by {group}")
+    img_box = fig_to_np(fig_box)
+
+    fig_vio, ax = plt.subplots(figsize=(6,3))
+    ax.violinplot(data, showmeans=True)
+    ax.set_xticks(range(1, len(gorder)+1)); ax.set_xticklabels(gorder)
+    ax.set_title(f"Violin of {value} by {group}")
+    img_vio = fig_to_np(fig_vio)
+    return txt, [img_box, img_vio]
+
+def levene_test(df: pd.DataFrame, value: str, group: str, center: str="median") -> Tuple[str, List[np.ndarray]]:
+    gorder = ordered_groups(df, group)
+    data = [df[df[group].astype(str) == g][value].dropna().astype(float).values for g in gorder]
+    if len(data) < 2:
+        raise gr.Error("Levene’s test requires at least two groups.")
+    W, p = stats.levene(*data, center=center)
+    txt = f"Levene’s test for equal variances on {value} by {group}\ncenter={center}, W = {W:.4g}, p = {p:.5g}"
+    return txt, []
 
 # ---------- PLOTS & CHECKS ----------
 def plot_hist(df: pd.DataFrame, col: str, bins: int = 30) -> Tuple[str, np.ndarray]:
@@ -712,8 +894,7 @@ def local_parse(user_input: str) -> Optional[Dict]:
 
     m = re.search(r"(?:what(?:'s| is) the )?(?:mean|average|summary|summarize|describe)\s+([a-zA-Z0-9_]+)(?:\s+by\s+([a-zA-Z0-9_]+))?", s)
     if m:
-        col = m.group(1)
-        by = m.group(2) if m.group(2) else None
+        col = m.group(1); by = m.group(2) if m.group(2) else None
         return {"tool":"stats","action":"summary","args":{"col":col, "by":by}}
 
     m = re.search(r"(t[\-\s]?test).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
@@ -723,6 +904,43 @@ def local_parse(user_input: str) -> Optional[Dict]:
     m = re.search(r"(anova).*(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
         return {"tool":"stats","action":"anova","args":{"value":m.group(2), "group":m.group(3)}}
+
+    # Chi-square / Fisher
+    m = re.search(r"(chi(?:-?square)?|chi2|chisq|fisher).*?(?:of|between|for)?\s*([a-zA-Z0-9_]+)\s*(?:by|x|vs|versus|and)\s*([a-zA-Z0-9_]+)", s)
+    if m:
+        exact = "fisher" in m.group(1)
+        return {"tool":"stats","action":"chisq","args":{"row":m.group(2), "col":m.group(3), "exact":exact}}
+
+    # Correlation (pair)
+    m = re.search(r"(pearson|spearman|correlation|correlate).*?(?:of|between)?\s*([a-zA-Z0-9_]+)\s*(?:and|&|,|vs|x)\s*([a-zA-Z0-9_]+)", s)
+    if m:
+        method = "pearson" if "pearson" in m.group(1) else ("spearman" if "spearman" in m.group(1) else "pearson")
+        return {"tool":"stats","action":"corr","args":{"x":m.group(2), "y":m.group(3), "method":method, "matrix":False}}
+
+    # Correlation heatmap/matrix
+    if re.search(r"(corr(?:elation)?\s*(matrix|heat\s*map|heatmap))", s):
+        return {"tool":"stats","action":"corr","args":{"matrix":True, "method":"pearson"}}
+
+    # Nonparametric rank-sum / Mann–Whitney
+    m = re.search(r"(mann[\-\s]?whitney|wilcoxon\s*rank\s*sum|rank\s*test).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
+    if m:
+        return {"tool":"stats","action":"mwutest","args":{"value":m.group(2), "group":m.group(3)}}
+
+    # Wilcoxon signed-rank (paired, two columns)
+    m = re.search(r"(wilcoxon).*?([a-zA-Z0-9_]+)\s*(?:vs|and|,)\s*([a-zA-Z0-9_]+)", s)
+    if m:
+        return {"tool":"stats","action":"wilcoxon","args":{"a":m.group(2), "b":m.group(3)}}
+
+    # Kruskal–Wallis
+    m = re.search(r"(kruskal|kw).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
+    if m:
+        return {"tool":"stats","action":"kruskal","args":{"value":m.group(2), "group":m.group(3)}}
+
+    # Levene’s test
+    m = re.search(r"(levene).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)(?:.*center\s*=\s*(median|mean|trimmed))?", s)
+    if m:
+        center = m.group(4) if m.group(4) else "median"
+        return {"tool":"stats","action":"levene","args":{"value":m.group(2), "group":m.group(3), "center":center}}
 
     m = re.search(r"(?:ols|regression)\s+([a-zA-Z0-9_]+)\s*~\s*([a-zA-Z0-9_+\s]+)", s)
     if m:
@@ -764,6 +982,40 @@ def local_parse(user_input: str) -> Optional[Dict]:
         pass
     return None
 
+# ---------- USER-FRIENDLY CLARIFICATION ----------
+def clarify_message(df: Optional[pd.DataFrame], llm_error_text: Optional[str], user_text: str) -> str:
+    prefix = "Sorry — I didn’t understand that request."
+    if llm_error_text:
+        prefix = f"{prefix} {llm_error_text}"
+    examples = [
+        "What is the average score?",
+        "Show a histogram of height.",
+        "I want to do a t-test on score by sex.",
+        "Pearson correlation height and weight.",
+        "Chi-square test of sex by group.",
+        "Mann-Whitney U test score by sex.",
+        "Kruskal-Wallis on score by group.",
+        "Wilcoxon pre vs post (two columns).",
+        "Correlation heatmap of numeric columns.",
+        "Check normality of score (QQ plot)."
+    ]
+    if df is not None:
+        try:
+            tech, ex = recommend_text_and_examples(df)
+            return (
+                f"{prefix}\n\nCould you clarify what you want to do?\n\n"
+                f"{tech}\n\nSay it like this\n{ex}"
+            )
+        except Exception:
+            pass
+    cols = []
+    if df is not None:
+        cols = list(map(str, df.columns))
+    col_text = f"\nDetected columns: {', '.join(cols)}" if cols else ""
+    return (
+        f"{prefix}\n\nTry one of these examples:\n• " + "\n• ".join(examples) + col_text
+    )
+
 # ---------- CHAT HANDLERS ----------
 def handle_upload(file):
     global cached_df
@@ -775,7 +1027,7 @@ def handle_upload(file):
         cols = ", ".join(map(str, df.columns))
         preview = df.head(200)
         return (
-            [{"role":"assistant","content":f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, hist/box/violin/bar, normality checks, power, quick summaries (e.g., 'What is the average height?'), or say 'what can I do with my data?'"}],
+            [{"role":"assistant","content":f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA, OLS/GLM, hist/box/violin/bar, normality checks, power, quick summaries, correlations, chi-square, rank tests, or say 'what can I do with my data?'"}],
             gr.update(value=preview, visible=True),
             gr.update(visible=True)
         )
@@ -799,13 +1051,11 @@ def need_value_and_group(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
 
 # ---------- GALLERY (Prev/Next) ----------
 def _safe_last(paths: List[str]) -> Tuple[Optional[str], List[str], int]:
-    """Return (preview, paths, idx). If empty, preview=None and idx=-1."""
     if paths:
         return paths[-1], paths, len(paths) - 1
     return None, [], -1
 
 def _step(paths: List[str], idx: int, delta: int) -> Tuple[Optional[str], int]:
-    """Move idx by delta with wrap-around. Returns (preview, new_idx)."""
     if not paths:
         return None, -1
     n = len(paths)
@@ -826,7 +1076,6 @@ def handle_chat(chat_history, user_message, data_preview):
     except Exception as e:
         llm_error_text = f"(LLM unavailable: {e})"
 
-    # NEW: Fallback to local parser if LLM didn't yield a tool call
     if not parsed:
         lp = local_parse(text)
         if lp:
@@ -836,30 +1085,28 @@ def handle_chat(chat_history, user_message, data_preview):
         pending = {"action": None, "need": None, "args": None}
 
     if not parsed:
-        reply = "I can help with t-tests, ANOVA, OLS/GLM, hist/box/violin/bar, normality, power, and quick summaries. Try: 'I want a t-test on score by sex' or 'Show a histogram of height'."
-        if llm_error_text:
-            reply = llm_error_text + " " + reply
-        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":reply}])
-        # no images produced
+        msg = clarify_message(cached_df, llm_error_text, text)
+        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
         preview, paths, idx = _safe_last([])
         return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
 
     if parsed.get("tool") != "stats":
-        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":"I'm not sure how to handle that yet."}])
+        msg = clarify_message(cached_df, llm_error_text, text)
+        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
         preview, paths, idx = _safe_last([])
         return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
 
     action = parsed.get("action")
-    args = sanitize_args(action, parsed.get("args", {}))  # sanitize 'null'-like args
+    args = sanitize_args(action, parsed.get("args", {}))
 
     if cached_df is None:
-        chat_history.append({"role":"assistant","content":"Please upload a CSV first."})
+        msg = "Please upload a CSV first."
+        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
         preview, paths, idx = _safe_last([])
         return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
 
     df = cached_df.copy()
     sections: List[Tuple[str, str, Optional[np.ndarray]]] = []
-    images: List[np.ndarray] = []
     image_paths: List[str] = []
 
     try:
@@ -876,7 +1123,7 @@ def handle_chat(chat_history, user_message, data_preview):
         # -------- Summary --------
         if action == "summary":
             col = args.get("col")
-            by = args.get("by")  # already sanitized to None if null-like
+            by = args.get("by")
             if col not in df.columns:
                 raise gr.Error(f"Column '{col}' not found.")
             if by is not None and by not in df.columns:
@@ -890,8 +1137,7 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- t-test --------
         if action == "ttest":
-            value = args.get("value")
-            group = args.get("group")  # sanitized
+            value = args.get("value"); group = args.get("group")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
                 pending.update({"action":"ttest","need":"value" if not value else "group","args":{"value":value,"group":group}})
@@ -904,16 +1150,12 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = run_ttest(df, value=value, group=group, paired=bool(args.get("paired", False)), equal_var=bool(args.get("equal_var", False)))
             sections.append(("t-test", txt, None))
             for i, im in enumerate(imgs):
-                if im is not None:
-                    images.append(im)
-                    pth = save_image_np(im, f"ttest_plot_{i+1}.png")
-                    image_paths.append(pth)
+                pth = save_image_np(im, f"ttest_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
         # -------- ANOVA --------
         elif action == "anova":
-            value = args.get("value")
-            group = args.get("group")  # sanitized
+            value = args.get("value"); group = args.get("group")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
                 pending.update({"action":"anova","need":"value" if not value else "group","args":{"value":value,"group":group}})
@@ -928,36 +1170,135 @@ def handle_chat(chat_history, user_message, data_preview):
             txt, imgs = run_anova(df, value=value, group=group)
             sections.append(("ANOVA", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"anova_plot_{i+1}.png")
-                image_paths.append(pth)
+                pth = save_image_np(im, f"anova_plot_{i+1}.png"); image_paths.append(pth)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
+        # -------- NEW: CHI-SQUARE / FISHER --------
+        elif action == "chisq":
+            row = args.get("row"); col = args.get("col"); exact = bool(args.get("exact", False))
+            if not row or not col:
+                cats = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+                ask = "Which two categorical columns for chi-square? Candidates: " + ", ".join(cats)
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = chisq_test(df, row=row, col=col, exact=exact)
+            sections.append(("Chi-square / Fisher", txt, None))
+            for i, im in enumerate(imgs):
+                pth = save_image_np(im, f"chisq_plot_{i+1}.png"); image_paths.append(pth)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
+        # -------- NEW: CORRELATION --------
+        elif action == "corr":
+            if bool(args.get("matrix", False)):
+                method = args.get("method","pearson")
+                cols = args.get("cols")
+                txt, imgs = corr_matrix_plot(df, cols=cols, method=method)
+                sections.append(("Correlation matrix", txt, None))
+                for i, im in enumerate(imgs):
+                    pth = save_image_np(im, f"corr_matrix_{method}_{i+1}.png"); image_paths.append(pth)
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":"Correlation matrix generated."}])
+            else:
+                x = args.get("x"); y = args.get("y"); method = args.get("method","pearson")
+                if not x or not y:
+                    nums = usable_numeric_cols(df)
+                    ask = "Which two numeric columns for correlation? Candidates: " + ", ".join(nums)
+                    chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                    preview, paths, idx = _safe_last([])
+                    return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                txt, imgs = corr_pair(df, x=x, y=y, method=method)
+                sections.append(("Correlation", txt, None))
+                for i, im in enumerate(imgs):
+                    pth = save_image_np(im, f"corr_pair_{method}_{i+1}.png"); image_paths.append(pth)
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
+        # -------- NEW: MANN–WHITNEY --------
+        elif action == "mwutest":
+            value = args.get("value"); group = args.get("group")
+            if not value or not group:
+                nums, groups = need_value_and_group(df)
+                ask = ("Which numeric outcome for Mann–Whitney? Candidates: " + ", ".join(nums)) if not value \
+                      else ("Which group column (2 levels needed)? Candidates: " + ", ".join(groups))
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = mann_whitney(df, value=value, group=group)
+            sections.append(("Mann–Whitney U", txt, None))
+            for i, im in enumerate(imgs):
+                pth = save_image_np(im, f"mwutest_plot_{i+1}.png"); image_paths.append(pth)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
+        # -------- NEW: WILCOXON SIGNED-RANK --------
+        elif action == "wilcoxon":
+            a = args.get("a"); b = args.get("b")
+            if not a or not b:
+                nums = usable_numeric_cols(df)
+                ask = "Which two columns are paired? Example: 'wilcoxon pre vs post'. Candidates: " + ", ".join(nums)
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = wilcoxon_signed(df, a=a, b=b)
+            sections.append(("Wilcoxon signed-rank", txt, None))
+            for i, im in enumerate(imgs):
+                pth = save_image_np(im, f"wilcoxon_plot_{i+1}.png"); image_paths.append(pth)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
+        # -------- NEW: KRUSKAL–WALLIS --------
+        elif action == "kruskal":
+            value = args.get("value"); group = args.get("group")
+            if not value or not group:
+                nums, groups = need_value_and_group(df)
+                ask = ("Which numeric outcome for Kruskal–Wallis? Candidates: " + ", ".join(nums)) if not value \
+                      else ("Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = kruskal_wallis(df, value=value, group=group)
+            sections.append(("Kruskal–Wallis", txt, None))
+            for i, im in enumerate(imgs):
+                pth = save_image_np(im, f"kruskal_plot_{i+1}.png"); image_paths.append(pth)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
+
+        # -------- NEW: LEVENE --------
+        elif action == "levene":
+            value = args.get("value"); group = args.get("group"); center = args.get("center","median")
+            if not value or not group:
+                nums, groups = need_value_and_group(df)
+                ask = ("Which numeric outcome for Levene? Candidates: " + ", ".join(nums)) if not value \
+                      else ("Which group column? Candidates: " + ", ".join(groups))
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                preview, paths, idx = _safe_last([])
+                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+            txt, imgs = levene_test(df, value=value, group=group, center=center)
+            sections.append(("Levene’s test", txt, None))
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
         # -------- OLS --------
         elif action == "ols":
             formula = args.get("formula")
             if not formula or "~" not in formula:
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":"Please specify a formula like: ols score ~ age + weight"}])
+                ask = "Please specify a formula like: `ols score ~ age + weight`."
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
                 preview, paths, idx = _safe_last([])
                 return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
             txt, imgs = run_ols(df, formula=formula)
             sections.append(("OLS", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"ols_plot_{i+1}.png")
-                image_paths.append(pth)
+                pth = save_image_np(im, f"ols_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
         # -------- GLM --------
         elif action == "glm":
             formula = args.get("formula"); family = args.get("family","gaussian")
             if not formula or "~" not in formula:
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":"Please specify a formula like: glm count ~ age family=poisson"}])
+                ask = "Please specify a formula like: `glm count ~ age` with `family=poisson`."
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
                 preview, paths, idx = _safe_last([])
                 return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
             txt, imgs = run_glm(df, formula=formula, family=family)
             sections.append((f"GLM ({family})", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"glm_plot_{i+1}.png")
-                image_paths.append(pth)
+                pth = save_image_np(im, f"glm_plot_{i+1}.png"); image_paths.append(pth)
             chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":txt}])
 
         # -------- PLOTS --------
@@ -968,8 +1309,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
             if "box" in args:
-                p = args["box"]
-                grp = p.get("group")
+                p = args["box"]; grp = p.get("group")
                 if grp is None:
                     nums, groups = need_value_and_group(df)
                     ask = "Which group column for the box plot? Candidates: " + ", ".join(groups)
@@ -983,8 +1323,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
             if "violin" in args:
-                p = args["violin"]
-                grp = p.get("group")
+                p = args["violin"]; grp = p.get("group")
                 if grp is None:
                     nums, groups = need_value_and_group(df)
                     ask = "Which group column for the violin plot? Candidates: " + ", ".join(groups)
@@ -998,8 +1337,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 sections.append((title, "", im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
             if "bar" in args:
-                p = args["bar"]
-                grp = p.get("group")
+                p = args["bar"]; grp = p.get("group")
                 if grp is None:
                     nums, groups = need_value_and_group(df)
                     ask = "Which group column for the bar chart? Candidates: " + ", ".join(groups)
@@ -1023,15 +1361,30 @@ def handle_chat(chat_history, user_message, data_preview):
                 sections.append(("Normality", msg, im))
                 chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
 
+        # -------- POWER --------
+        elif action == "power":
+            if "ttest_ind" in args:
+                p = args["ttest_ind"]
+                msg = power_ttest_ind(p.get("effect_size",0.5), float(p.get("alpha",0.05)), p.get("power",0.8), float(p.get("ratio",1.0)), p.get("solve_for","n_total"))
+                sections.append(("Power – t-test (ind)", msg, None))
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+            if "anova_oneway" in args:
+                p = args["anova_oneway"]
+                msg = power_anova_oneway(p.get("effect_size",0.25), int(p.get("k_groups",3)), float(p.get("alpha",0.05)), p.get("power",0.8), p.get("solve_for","n_per_group"))
+                sections.append(("Power – ANOVA (one-way)", msg, None))
+                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+
         else:
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"Unknown action: {action}"}])
+            msg = clarify_message(df, llm_error_text, text)
+            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
 
     except gr.Error as e:
-        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":str(e)}])
+        msg = f"Sorry — {e}"
+        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
         preview, paths, idx = _safe_last([])
         return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
     except Exception as e:
-        msg = f"Error: {e}"
+        msg = f"Sorry — something went wrong: {e}"
         chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
         preview, paths, idx = _safe_last([])
         return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
@@ -1055,14 +1408,8 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
     <style>
     #logo-img img { height: 90px; margin: 10px 50px 10px 10px; border-radius: 6px; }
     .dataframe-wrap { max-height: 340px; overflow: auto; border: 1px solid #ddd; border-radius: 6px; padding: 6px; }
-    /* NEW: keep nav buttons tight under the preview and right-aligned */
     #preview-plot { margin-bottom: 6px; }
-    #plot-nav {
-      margin: 0 0 10px 0;
-      display: flex;
-      gap: 8px;
-      justify-content: flex-end;
-    }
+    #plot-nav { margin: 0 0 10px 0; display: flex; gap: 8px; justify-content: flex-end; }
     </style>
     """)
     gr.Markdown("## 📊 SpatChat: Stats Room {stats}")
@@ -1091,9 +1438,9 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 label="SpatChat",
                 show_label=True,
                 type="messages",
-                value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test, ANOVA, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries (e.g., 'What is the average height?'), or 'what can I do with my data?'."}]
+                value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test, ANOVA, correlations, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Kruskal–Wallis, Levene’s, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'."}]
             )
-            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., I want a t-test on score by sex", lines=1)
+            user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., Pearson correlation height and weight", lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
         with gr.Column(scale=3):
             preview_plot = gr.Image(
@@ -1103,7 +1450,6 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 elem_id="preview-plot"
             )
 
-            # Buttons directly under the plot (not at bottom)
             with gr.Row(elem_id="plot-nav"):
                 prev_btn = gr.Button("◀️ Prev", variant="secondary")
                 next_btn = gr.Button("Next ▶️", variant="secondary")
@@ -1111,11 +1457,9 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
             data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
             download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False)
 
-            # Gallery states
             gallery_paths = gr.State([])
             gallery_index = gr.State(-1)
 
-    # Enable queue (older-Gradio-safe signature)
     demo.queue(max_size=16)
 
     file_input.change(handle_upload, inputs=file_input, outputs=[chatbot, data_preview, download_btn])
@@ -1127,7 +1471,6 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
     )
     user_input.submit(lambda *args: "", inputs=None, outputs=user_input)
 
-    # Button callbacks
     def on_prev(paths, idx):
         preview, new_idx = _step(paths, idx, -1)
         return gr.update(value=preview), new_idx
