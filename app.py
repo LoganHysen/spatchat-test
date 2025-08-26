@@ -368,9 +368,13 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
 
     overview_lines = [f"Dataset overview: n={n} rows, p={p} columns."]
     if nums_all:
-        overview_lines.append(f"- Numeric columns ({len(nums_all)}): {', ',}.join(map(str, nums_all[:8])){'…' if len(nums_all)>8 else ''}")
+        overview_lines.append(
+            f"- Numeric columns ({len(nums_all)}): {', '.join(map(str, nums_all[:8]))}{'…' if len(nums_all)>8 else ''}"
+        )
     if cats:
-        overview_lines.append(f"- Categorical/low-cardinality ({len(cats)}): {', '.join(map(str, cats[:8]))}{'…' if len(cats)>8 else ''}")
+        overview_lines.append(
+            f"- Categorical/low-cardinality ({len(cats)}): {', '.join(map(str, cats[:8]))}{'…' if len(cats)>8 else ''}"
+        )
 
     rec_lines = ["Here are some analysis ideas you can run next:"]
     if y_num:
@@ -821,7 +825,12 @@ def handle_chat(chat_history, user_message, data_preview):
         parsed = tool
     except Exception as e:
         llm_error_text = f"(LLM unavailable: {e})"
-        parsed = local_parse(text)
+
+    # NEW: Fallback to local parser if LLM didn't yield a tool call
+    if not parsed:
+        lp = local_parse(text)
+        if lp:
+            parsed = lp
 
     if pending["action"] and parsed and parsed.get("tool") == "stats":
         pending = {"action": None, "need": None, "args": None}
