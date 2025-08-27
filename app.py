@@ -1,3 +1,6 @@
+# --------------------------
+# Imports
+# --------------------------
 import os
 import io
 import re
@@ -13,6 +16,8 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
+from textwrap import dedent
 import gradio as gr
 from dotenv import load_dotenv
 
@@ -35,7 +40,9 @@ except Exception:
 
 print("Starting SpatChat: Stats Room (chat-first)")
 
-# ---------- GLOBALS ----------
+# --------------------------
+# GLOBALS
+# --------------------------
 cached_df: Optional[pd.DataFrame] = None
 outputs_dir = "outputs"
 os.makedirs(outputs_dir, exist_ok=True)
@@ -43,11 +50,14 @@ os.makedirs(outputs_dir, exist_ok=True)
 # Track if we asked a follow-up
 pending: Dict[str, Optional[str]] = {"action": None, "need": None, "args": None}
 
-# ---------- LLM (HF primary, Together fallback) ----------
-load_dotenv()
 
+# --------------------------
+# LLM (HF primary, Together fallback)
+# --------------------------
+load_dotenv()
 HF_MODEL_DEFAULT = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 TOGETHER_MODEL_DEFAULT = "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"
+
 
 def _choice_content(choice):
     msg = getattr(choice, "message", None)
@@ -69,16 +79,19 @@ def _choice_content(choice):
         content = "".join(parts)
     return content or ""
 
+
 def _delta_text(delta):
     if isinstance(delta, dict):
         return delta.get("content", "")
     return getattr(delta, "content", "")
+
 
 class _SpacedCallLimiter:
     def __init__(self, min_interval_seconds: float):
         self.min_interval = float(min_interval_seconds)
         self._lock = threading.Lock()
         self._last = 0.0
+
     def wait(self):
         with self._lock:
             now = time.monotonic()
@@ -87,17 +100,19 @@ class _SpacedCallLimiter:
                 time.sleep(self.min_interval - elapsed)
             self._last = time.monotonic()
 
+
 class UnifiedLLM:
     def __init__(self):
         hf_model_or_url = (os.getenv("HF_ENDPOINT_URL") or HF_MODEL_DEFAULT).strip()
         hf_token = (os.getenv("HF_TOKEN") or "").strip()
         self.hf_client = InferenceClient(model=hf_model_or_url, token=hf_token, timeout=300)
+
         self.together = None
         self.together_model = (os.getenv("TOGETHER_MODEL") or TOGETHER_MODEL_DEFAULT).strip()
         tg_key = (os.getenv("TOGETHER_API_KEY") or "").strip()
         if tg_key:
             self.together = Together(api_key=tg_key)
-            self._tg_limiter = _SpacedCallLimiter(min_interval_seconds=100.0)
+        self._tg_limiter = _SpacedCallLimiter(min_interval_seconds=100.0)
 
     @staticmethod
     def _messages_to_prompt(messages):
@@ -121,10 +136,7 @@ class UnifiedLLM:
             try:
                 if hasattr(self.hf_client, "chat_completion"):
                     resp = self.hf_client.chat_completion(
-                        messages=messages,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                        stream=stream,
+                        messages=messages, max_tokens=max_tokens, temperature=temperature, stream=stream
                     )
                     if stream:
                         text = "".join(_delta_text(ch.choices[0].delta) for ch in resp)
@@ -134,7 +146,11 @@ class UnifiedLLM:
                 else:
                     prompt = self._messages_to_prompt(messages)
                     text = self.hf_client.text_generation(
-                        prompt, max_new_tokens=max_tokens, temperature=temperature, stream=False, return_full_text=False
+                        prompt,
+                        max_new_tokens=max_tokens,
+                        temperature=temperature,
+                        stream=False,
+                        return_full_text=False,
                     )
                     return text
             except Exception as e:
@@ -168,6 +184,7 @@ class UnifiedLLM:
                     time.sleep(backoff + random.uniform(0, 3))
                     backoff *= 1.8
 
+
 llm = UnifiedLLM()
 
 SYSTEM_PROMPT = """
@@ -184,7 +201,7 @@ Actions and args:
 - ols: {"formula":"y ~ x1 + x2"}
 - glm: {"formula":"y ~ x1 + x2", "family":"gaussian|binomial|poisson|gamma"}
 - chisq: {"row":"catA","col":"catB","exact": false}
-- corr:  {"x":"col1","y":"col2","method":"pearson|spearman","matrix": false, "cols": ["colA","colB", "..."]}
+- corr: {"x":"col1","y":"col2","method":"pearson|spearman","matrix": false, "cols": ["colA","colB", "..."]}
 - pcorr: {"x":"col1","y":"col2","controls":["c1","c2"],"method":"pearson|spearman"}
 - pbiserial: {"value":"numericCol","group":"binaryCol"}
 - mwutest: {"value":"colY","group":"colG"}
@@ -193,12 +210,13 @@ Actions and args:
 - plot: one of {"hist":{"col":"c","bins":30}, "box":{"value":"y","group":"g"}, "violin":{"value":"y","group":"g"}, "bar":{"value":"y","group":"g","error":"sem|sd|ci95"}}
 - check: {"normality":{"col":"y"}}
 - power: one of
-   {"ttest_ind": {"effect_size": 0.5, "alpha": 0.05, "power": 0.8, "ratio": 1.0, "solve_for":"n_total|power|effect_size"}}
-   {"anova_oneway": {"effect_size": 0.25, "k_groups": 3, "alpha": 0.05, "power": 0.8, "solve_for":"n_per_group|power|effect_size"}}
+  {"ttest_ind": {"effect_size": 0.5, "alpha": 0.05, "power": 0.8, "ratio": 1.0, "solve_for":"n_total|power|effect_size"}}
+  {"anova_oneway": {"effect_size": 0.25, "k_groups": 3, "alpha": 0.05, "power": 0.8, "solve_for":"n_per_group|power|effect_size"}}
 - summary: {"col":"y", "by":"group_col_or_null"}
 - recommend: {}
 
-If unclear, pick sensible defaults from the dataset. NEVER include prose; JSON only.
+If unclear, pick sensible defaults from the dataset.
+NEVER include prose; JSON only.
 For general questions, answer in <=3 sentences of plain text.
 """.strip()
 
@@ -206,12 +224,18 @@ FALLBACK_PROMPT = """
 You are SpatChat, a concise statistics tutor. If you can't map to a tool call, answer naturally in <=3 sentences.
 """.strip()
 
-# ---------- CHAT RENDERING HELP ----------
+
+# --------------------------
+# CHAT RENDERING HELP
+# --------------------------
 def _fence(text: str) -> str:
     """Wrap multi-line stats text to prevent Markdown table parsing in the chat UI."""
-    return f"```text\n{text}\n```"
+    return "```text\n" + dedent(str(text)).strip() + "\n```"
 
-# ---------- PLOTTING HELPERS ----------
+
+# --------------------------
+# PLOTTING HELPERS
+# --------------------------
 def fig_to_np(fig: plt.Figure) -> np.ndarray:
     buf = io.BytesIO()
     fig.tight_layout()
@@ -219,18 +243,192 @@ def fig_to_np(fig: plt.Figure) -> np.ndarray:
     plt.close(fig)
     buf.seek(0)
     import PIL.Image as Image
+
     img = Image.open(buf).convert("RGB")
     return np.array(img)
+
 
 def save_image_np(arr: np.ndarray, fname: str) -> str:
     fp = os.path.join(outputs_dir, fname)
     import PIL.Image as Image
+
     Image.fromarray(arr).save(fp, format="PNG")
     return fp
 
-# ---------- REPORT & ZIP ----------
+
+# ---------- HOUSE STYLE (NEW) ----------
+def set_house_style():
+    sns.set_theme(style="whitegrid", context="talk")
+    plt.rcParams.update(
+        {
+            "axes.titlesize": 16,
+            "axes.labelsize": 12,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+            "lines.linewidth": 1.5,
+            "axes.grid": True,
+            "grid.alpha": 0.2,
+            "savefig.dpi": 300,
+            "figure.dpi": 120,
+            "legend.frameon": False,
+        }
+    )
+
+
+# Call once on import
+set_house_style()
+
+
+# --------------------------
+# NICER PLOTTING PRIMITIVES (Seaborn)
+# --------------------------
+def _render(fig: plt.Figure) -> np.ndarray:
+    try:
+        return fig_to_np(fig)
+    finally:
+        plt.close(fig)
+
+
+def _sb_errorbar_kwargs() -> dict:
+    """Handle Seaborn API differences (errorbar=None in 0.12+, ci=None in 0.11)."""
+    try:
+        major, minor = [int(p) for p in sns.__version__.split(".")[:2]]
+        return {"errorbar": None} if (major, minor) >= (0, 12) else {"ci": None}
+    except Exception:
+        return {"ci": None}
+
+
+def point_ci_plot_from_summary(
+    summary_df: pd.DataFrame,
+    x: str,
+    y: str,
+    ci_low: str,
+    ci_high: str,
+    title: str,
+    ylabel: Optional[str] = None,
+) -> np.ndarray:
+    cats = list(summary_df[x].astype(str))
+    fig, ax = plt.subplots(figsize=(6, 3))
+    sns.pointplot(data=summary_df, x=x, y=y, order=cats, join=False, ax=ax, **_sb_errorbar_kwargs())
+    # custom CI whiskers at integer tick positions
+    for i, r in enumerate(summary_df.itertuples()):
+        ylo, yhi = getattr(r, ci_low), getattr(r, ci_high)
+        ax.vlines(i, ylo, yhi, lw=1.5)
+        ax.plot([i - 0.05, i + 0.05], [ylo, ylo], lw=1.5)
+        ax.plot([i - 0.05, i + 0.05], [yhi, yhi], lw=1.5)
+    ax.set_title(title)
+    ax.set_xlabel(x)
+    if ylabel:
+        ax.set_ylabel(ylabel)
+    ax.set_xticks(range(len(cats)))
+    ax.set_xticklabels(cats)
+    fig.tight_layout()
+    return _render(fig)
+
+
+def bar_with_error_plot(
+    df: pd.DataFrame, value: str, group: str, error: str = "sem", gorder: Optional[List[str]] = None
+) -> np.ndarray:
+    """
+    Seaborn-styled bar means ± error over groups (SEM, SD, or CI95).
+    Returns NumPy image array. Replaces the old matplotlib-only version.
+    """
+    if gorder is None:
+        gorder = ordered_groups(df, group)
+
+    d = df[[value, group]].dropna().copy()
+    d[group] = d[group].astype(str)
+
+    desc = d.groupby(group)[value].agg(["mean", "std", "count"]).reset_index()
+    desc.rename(columns={group: "group"}, inplace=True)
+    desc["group"] = desc["group"].astype(str)
+    desc = desc.set_index("group").reindex(gorder).reset_index()
+
+    if error.lower() == "sd":
+        yerr = desc["std"].to_numpy()
+    elif error.lower() in {"ci95", "ci", "ci_95"}:
+        se = desc["std"] / np.sqrt(desc["count"].clip(lower=1))
+        tcrit = stats.t.ppf(0.975, df=(desc["count"] - 1).clip(lower=1))
+        yerr = (se * tcrit).to_numpy()
+    else:
+        # default "sem"
+        yerr = (desc["std"] / np.sqrt(desc["count"].clip(lower=1))).to_numpy()
+
+    x_pos = np.arange(len(desc))
+    fig, ax = plt.subplots(figsize=(6, 3))
+    sns.barplot(data=desc, x="group", y="mean", order=gorder, ax=ax, **_sb_errorbar_kwargs())
+    ax.errorbar(x=x_pos, y=desc["mean"], yerr=yerr, fmt="none", capsize=4, lw=1.5)
+    ax.set_xlabel(group)
+    ax.set_ylabel(value)
+    ax.set_title(f"Bar ± {error.upper()} of {value} by {group}")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(gorder)
+    fig.tight_layout()
+    return _render(fig)
+
+
+def box_plot(df: pd.DataFrame, value: str, group: str) -> np.ndarray:
+    gorder = ordered_groups(df, group)
+    fig, ax = plt.subplots(figsize=(6, 3))
+    sns.boxplot(data=df, x=group, y=value, order=gorder, ax=ax)
+    ax.set_title(f"Boxplot of {value} by {group}")
+    fig.tight_layout()
+    return _render(fig)
+
+
+def violin_plot(df: pd.DataFrame, value: str, group: str) -> np.ndarray:
+    gorder = ordered_groups(df, group)
+    fig, ax = plt.subplots(figsize=(6, 3))
+    sns.violinplot(data=df, x=group, y=value, order=gorder, inner="quartile", cut=0, ax=ax)
+    ax.set_title(f"Violin of {value} by {group}")
+    fig.tight_layout()
+    return _render(fig)
+
+
+def scatter_with_reg(df: pd.DataFrame, x: str, y: str, ci: float = 0.95, title: Optional[str] = None) -> np.ndarray:
+    fig, ax = plt.subplots(figsize=(6, 3))
+    sns.regplot(data=df, x=x, y=y, ci=int(ci * 100), ax=ax)
+    ax.set_title(title or f"{y} vs {x} with linear fit")
+    fig.tight_layout()
+    return _render(fig)
+
+
+# --------------------------
+# EFFECT SIZES + UTILITIES (reusable)
+# --------------------------
+def _cohen_d_independent_from_arrays(
+    a: np.ndarray, b: np.ndarray, equal_var: bool = False
+) -> Tuple[float, float]:
+    """
+    Returns (Cohen's d, Hedges' g) for two independent samples.
+    If equal_var=True, uses pooled SD; else average of group SDs.
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    mean_a, mean_b = np.nanmean(a), np.nanmean(b)
+    va, vb = np.nanvar(a, ddof=1), np.nanvar(b, ddof=1)
+    na, nb = np.isfinite(a).sum(), np.isfinite(b).sum()
+    diff = mean_a - mean_b
+
+    if equal_var:
+        denom_df = max(1, (na + nb - 2))
+        sp2 = ((na - 1) * va + (nb - 1) * vb) / denom_df if denom_df > 0 else np.nan
+        sd = np.sqrt(sp2) if sp2 > 0 else np.nan
+    else:
+        sd = np.sqrt((va + vb) / 2.0) if (va > 0 and vb > 0) else np.nan
+
+    d = diff / sd if (sd and sd > 0) else np.nan
+    J = 1 - (3 / (4 * (na + nb - 2) - 1)) if (na + nb - 2) > 1 else 1.0
+    g = d * J if np.isfinite(d) else np.nan
+    return d, g
+
+
+# --------------------------
+# REPORT & ZIP
+# --------------------------
 def add_to_report(parts: List[str], title: str, html_fragment: str):
     parts.append(f"<h2>{title}</h2>{html_fragment}")
+
 
 def write_report(sections: List[Tuple[str, str, Optional[np.ndarray]]]) -> str:
     parts = ["<h1>SpatChat – Stats Report</h1>"]
@@ -238,15 +436,19 @@ def write_report(sections: List[Tuple[str, str, Optional[np.ndarray]]]) -> str:
         add_to_report(parts, title, f"<pre style='white-space:pre-wrap'>{html_text}</pre>")
         if img_np is not None:
             import PIL.Image as Image, base64
+
             buf = io.BytesIO()
             Image.fromarray(img_np).save(buf, format="PNG")
             b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-            parts.append(f"<img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto' />")
+            parts.append(
+                f"<img src='data:image/png;base64,{b64}' style='max-width:100%;height:auto' />"
+            )
     html = "\n".join(parts).encode("utf-8")
     fp = os.path.join(outputs_dir, "stats_report.html")
     with open(fp, "wb") as f:
         f.write(html)
     return fp
+
 
 def save_zip() -> str:
     archive = os.path.join(outputs_dir, "spatchat_stats_results.zip")
@@ -255,19 +457,26 @@ def save_zip() -> str:
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
         for root, _, files in os.walk(outputs_dir):
             for fn in files:
-                if fn.endswith('.zip'):
+                if fn.endswith(".zip"):
                     continue
                 full = os.path.join(root, fn)
                 z.write(full, arcname=fn)
     return archive
+
 
 def clear_outputs():
     if os.path.exists(outputs_dir):
         shutil.rmtree(outputs_dir)
     os.makedirs(outputs_dir, exist_ok=True)
 
-# ---------- SCHEMA & RECOMMENDATIONS ----------
-ID_NAME_PAT = re.compile(r"(?:^|[_\W])(id|identifier|index|subject|animal|record|row)(?:[_\W]|$)", re.I)
+
+# --------------------------
+# SCHEMA & RECOMMENDATIONS
+# --------------------------
+ID_NAME_PAT = re.compile(
+    r"(?:^|[_\W])(id|identifier|index|subject|animal|record|row)(?:[_\W]|$)", re.I
+)
+
 
 def is_id_like(df: pd.DataFrame, col: str) -> bool:
     name = str(col).strip().lower()
@@ -290,12 +499,14 @@ def is_id_like(df: pd.DataFrame, col: str) -> bool:
         return False
     return (diffs == 1).mean() >= 0.9
 
+
 def is_integer_like(series: pd.Series) -> bool:
     s = series.dropna()
     if s.empty or not pd.api.types.is_numeric_dtype(s):
         return False
     frac = np.abs(s.astype(float) - np.round(s.astype(float)))
     return (frac > 1e-9).mean() <= 0.05
+
 
 def infer_schema(df: pd.DataFrame) -> Dict:
     n, p = df.shape
@@ -325,11 +536,13 @@ def infer_schema(df: pd.DataFrame) -> Dict:
             binary.append(c)
 
     return {
-        "n_rows": n, "n_cols": p,
+        "n_rows": n,
+        "n_cols": p,
         "numeric_all": numeric_all,
         "categorical": list(dict.fromkeys(categorical)),
-        "binary": binary
+        "binary": binary,
     }
+
 
 def usable_numeric_cols(df: pd.DataFrame) -> List[str]:
     nums = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -341,13 +554,13 @@ def usable_numeric_cols(df: pd.DataFrame) -> List[str]:
         ordered = nums
     return ordered
 
+
 def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
     info = infer_schema(df)
     n, p = info["n_rows"], info["n_cols"]
     nums_all = info["numeric_all"]
     cats = info["categorical"]
     bins = info["binary"]
-
     nums_safe = usable_numeric_cols(df)
     y_num = nums_safe[0] if nums_safe else (nums_all[0] if nums_all else None)
 
@@ -391,8 +604,8 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
         rec_lines.append(f"• **Box/violin plots** of **{y_num}** across **{g_multi}**.")
     if len(nums_safe) >= 2:
         rec_lines.append(f"• **Correlation**: Pearson or Spearman between **{nums_safe[0]}** and **{nums_safe[1]}**.")
-        if len(nums_safe) >= 3:
-            rec_lines.append(f"• **Correlation heatmap** for numeric columns.")
+    if len(nums_safe) >= 3:
+        rec_lines.append(f"• **Correlation heatmap** for numeric columns.")
         rec_lines.append(f"• **Partial correlation** between two variables controlling for others.")
         rec_lines.append(f"• See how one value predicts another (linear regression), e.g., **{nums_safe[0]} ~ {nums_safe[1]}**.")
     if len(cats) >= 2:
@@ -411,12 +624,12 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
         ex.append(f'• "I want to do a t-test on {y_num} by {g_bin}."')
         ex.append(f'• "Mann-Whitney U test on {y_num} by {g_bin}."')
         ex.append(f'• "Point-biserial correlation {y_num} by {g_bin}."')
-        ex.append(f'• "Levene\'s test for {y_num} by {g_bin}."')
+        ex.append("• \"Levene's test for {y_num} by {g_bin}.\"")
     if y_num and g_multi:
         ex.append(f'• "Run a one-way ANOVA of {y_num} by {g_multi}."')
         ex.append(f'• "Tukey HSD for {y_num} by {g_multi}."')
         ex.append(f'• "Kruskal-Wallis on {y_num} by {g_multi}."')
-        ex.append(f'• "Dunn\'s post-hoc for {y_num} by {g_multi}."')
+        ex.append("• \"Dunn's post-hoc for {y_num} by {g_multi}.\"")
         ex.append(f'• "Show box and violin plots for {y_num} by {g_multi}."')
     if len(nums_safe) >= 2:
         ex.append(f'• "Pearson correlation between {nums_safe[0]} and {nums_safe[1]}."')
@@ -434,7 +647,10 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
 
     return "\n".join(overview_lines + [""] + rec_lines), "\n".join(ex)
 
-# ---------- GROUP ORDER ----------
+
+# --------------------------
+# GROUP ORDER
+# --------------------------
 def ordered_groups(df: pd.DataFrame, group_col: str) -> List[str]:
     s = df[group_col]
     if pd.api.types.is_categorical_dtype(s):
@@ -447,14 +663,19 @@ def ordered_groups(df: pd.DataFrame, group_col: str) -> List[str]:
     except Exception:
         return sorted(vals, key=lambda x: (str(x).lower(), str(x)))
 
-# ---------- NULL-LIKE SANITIZATION ----------
+
+# --------------------------
+# NULL-LIKE SANITIZATION
+# --------------------------
 NULLY_STRINGS = {"", "null", "none", "na", "n/a", "nil"}
+
 
 def clean_null_like(v: Optional[str]) -> Optional[str]:
     if v is None:
         return None
     s = str(v).strip().lower()
     return None if s in NULLY_STRINGS else v
+
 
 def sanitize_args(action: Optional[str], args: Dict) -> Dict:
     if not isinstance(args, dict):
@@ -483,7 +704,10 @@ def sanitize_args(action: Optional[str], args: Dict) -> Dict:
         args["b"] = clean_null_like(args.get("b"))
     return args
 
-# ---------- ANALYSES ----------
+
+# --------------------------
+# ANALYSES
+# --------------------------
 def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=False, paired=False) -> str:
     if paired:
         stat, p = stats.ttest_rel(a, b, nan_policy="omit")
@@ -494,52 +718,61 @@ def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=Fals
         test_name = "Student t-test" if equal_var else "Welch t-test"
         va, vb = np.var(a, ddof=1), np.var(b, ddof=1)
         na, nb = len(a), len(b)
-        df_est = (va/na + vb/nb)**2 / ((va**2)/((na**2)*(na-1)) + (vb**2)/((nb**2)*(nb-1)))
+        df_est = (va / na + vb / nb) ** 2 / (
+            (va**2) / ((na**2) * (na - 1)) + (vb**2) / ((nb**2) * (nb - 1))
+        )
+
     mean_a, mean_b = a.mean(), b.mean()
     sd_a, sd_b = a.std(ddof=1), b.std(ddof=1)
     diff = mean_a - mean_b
-    se = np.sqrt(sd_a**2/len(a) + sd_b**2/len(b))
+    se = np.sqrt(sd_a**2 / len(a) + sd_b**2 / len(b))
     try:
         tcrit = stats.t.ppf(0.975, df=df_est)
-        ci_low, ci_high = diff - tcrit*se, diff + tcrit*se
+        ci_low, ci_high = diff - tcrit * se, diff + tcrit * se
     except Exception:
         ci_low = ci_high = np.nan
-    sp = np.sqrt(((len(a)-1)*sd_a**2 + (len(b)-1)*sd_b**2) / (len(a)+len(b)-2)) if len(a)+len(b)-2 > 0 else np.nan
+
+    sp = np.sqrt(((len(a) - 1) * sd_a**2 + (len(b) - 1) * sd_b**2) / (len(a) + len(b) - 2)) if len(a) + len(b) - 2 > 0 else np.nan
     d = diff / sp if sp and sp > 0 else np.nan
-    J = 1 - (3 / (4*(len(a)+len(b)-2) - 1)) if (len(a)+len(b)-2) > 1 else 1.0
+    J = 1 - (3 / (4 * (len(a) + len(b) - 2) - 1)) if (len(a) + len(b) - 2) > 1 else 1.0
     g = d * J if d is not None else np.nan
+
     lines = [
         "t-test",
         test_name,
         f"Groups: {g1} (n={len(a)}, mean={mean_a:.3g}, sd={sd_a:.3g}) vs {g2} (n={len(b)}, mean={mean_b:.3g}, sd={sd_b:.3g})",
         f"Mean difference = {diff:.3g}, 95% CI [{ci_low:.4g}, {ci_high:.4g}]",
         f"t({df_est:.2f}) = {stat:.3g}, p = {p:.5g}",
-        f"Effect size: Cohen's d = {d:.3g}, Hedges' g = {g:.3g}"
+        f"Effect size: Cohen's d = {d:.3g}, Hedges' g = {g:.3g}",
     ]
     return "\n".join(lines)
 
-def run_ttest(df: pd.DataFrame, value: str, group: str, paired=False, equal_var=False) -> Tuple[str, List[np.ndarray]]:
+
+def run_ttest(
+    df: pd.DataFrame, value: str, group: str, paired: bool = False, equal_var: bool = False
+) -> Tuple[str, List[np.ndarray]]:
     gorder = ordered_groups(df, group)
     if len(gorder) != 2:
         raise gr.Error(f"t-test requires exactly 2 groups; {group} has {len(gorder)} levels.")
+
     a = df[df[group].astype(str) == gorder[0]][value].dropna().astype(float).values
     b = df[df[group].astype(str) == gorder[1]][value].dropna().astype(float).values
 
-    fig_box, ax = plt.subplots(figsize=(5,3))
-    ax.boxplot([a, b], tick_labels=[gorder[0], gorder[1]])
-    ax.set_title(f"Boxplot of {value} by {group}")
-    img_box = fig_to_np(fig_box)
-
-    fig_vio, ax = plt.subplots(figsize=(5,3))
-    ax.violinplot([a, b], showmeans=True)
-    ax.set_xticks([1,2]); ax.set_xticklabels([gorder[0], gorder[1]])
-    ax.set_title(f"Violin of {value} by {group}")
-    img_vio = fig_to_np(fig_vio)
-
+    # Figures (Seaborn)
     img_bar = bar_with_error_plot(df, value, group, error="sem", gorder=gorder)
+    img_box = box_plot(df, value, group)
+    img_vio = violin_plot(df, value, group)
 
+    # Stats (reuse summary)
     txt = ttest_summary(a, b, gorder[0], gorder[1], equal_var=equal_var, paired=paired)
+
+    # OPTIONAL: annotate stars over bar (uncomment to enable)
+    # stat, pval = (stats.ttest_ind(a, b, equal_var=equal_var, nan_policy="omit")
+    #               if not paired else stats.ttest_rel(a, b, nan_policy="omit"))
+    # img_bar = annotate_ttest_on_bar(df, value, group, gorder[0], gorder[1], float(pval))
+
     return txt, [img_bar, img_box, img_vio]
+
 
 def run_anova(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
     gorder = ordered_groups(df, group)
@@ -549,47 +782,44 @@ def run_anova(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.nd
     F, p = stats.f_oneway(*data)
     txt = f"One-way ANOVA on {value} by {group}\nGroups: {', '.join(gorder)}\nF = {F:.4g}, p = {p:.5g}"
 
-    fig_box, ax = plt.subplots(figsize=(6,3))
-    ax.boxplot(data, tick_labels=gorder)
-    ax.set_title(f"Boxplot of {value} by {group}")
-    img_box = fig_to_np(fig_box)
-
-    fig_vio, ax = plt.subplots(figsize=(6,3))
-    ax.violinplot(data, showmeans=True)
-    ax.set_xticks(range(1, len(gorder)+1)); ax.set_xticklabels(gorder)
-    ax.set_title(f"Violin of {value} by {group}")
-    img_vio = fig_to_np(fig_vio)
-
+    img_box = box_plot(df, value, group)
+    img_vio = violin_plot(df, value, group)
     return txt, [img_box, img_vio]
+
 
 def run_ols(df: pd.DataFrame, formula: str) -> Tuple[str, List[np.ndarray]]:
     model = smf.ols(formula, data=df).fit()
-    coef = model.summary2().tables[1].reset_index().rename(columns={"index":"term"})
+    coef = model.summary2().tables[1].reset_index().rename(columns={"index": "term"})
     coef.to_csv(os.path.join(outputs_dir, "ols_coef.csv"), index=False)
 
     images: List[np.ndarray] = []
 
-    lhs, rhs = [s.strip() for s in formula.split("~",1)]
+    lhs, rhs = [s.strip() for s in formula.split("~", 1)]
     terms = [t.strip() for t in re.split(r"\+", rhs) if t.strip()]
     if len(terms) == 1 and terms[0] in df.columns and pd.api.types.is_numeric_dtype(df[terms[0]]):
-        x = df[terms[0]].astype(float); y = df[lhs].astype(float)
+        x = df[terms[0]].astype(float)
+        y = df[lhs].astype(float)
         order = np.argsort(x.values)
-        fig, ax = plt.subplots(figsize=(6,3))
+        fig, ax = plt.subplots(figsize=(6, 3))
         ax.scatter(x, y)
         ax.plot(x.values[order], model.fittedvalues.values[order])
-        ax.set_xlabel(terms[0]); ax.set_ylabel(lhs); ax.set_title("Scatter + OLS fit")
+        ax.set_xlabel(terms[0])
+        ax.set_ylabel(lhs)
+        ax.set_title("Scatter + OLS fit")
         images.append(fig_to_np(fig))
 
-    fig_r, ax = plt.subplots(figsize=(6,3))
+    fig_r, ax = plt.subplots(figsize=(6, 3))
     ax.scatter(model.fittedvalues, model.resid)
     ax.axhline(0, linestyle=":")
-    ax.set_xlabel("Fitted"); ax.set_ylabel("Residuals"); ax.set_title("Residuals vs Fitted")
+    ax.set_xlabel("Fitted")
+    ax.set_ylabel("Residuals")
+    ax.set_title("Residuals vs Fitted")
     images.append(fig_to_np(fig_r))
 
     sm.qqplot(model.resid, line="45", fit=True)
     images.append(fig_to_np(plt.gcf()))
-
     return str(model.summary()), images
+
 
 def run_glm(df: pd.DataFrame, formula: str, family: str) -> Tuple[str, List[np.ndarray]]:
     fam_map = {
@@ -600,48 +830,49 @@ def run_glm(df: pd.DataFrame, formula: str, family: str) -> Tuple[str, List[np.n
     }
     fam = fam_map.get(family.lower(), sm.families.Gaussian())
     model = smf.glm(formula, data=df, family=fam).fit()
-    coef = model.summary2().tables[1].reset_index().rename(columns={"index":"term"})
+    coef = model.summary2().tables[1].reset_index().rename(columns={"index": "term"})
     coef.to_csv(os.path.join(outputs_dir, "glm_coef.csv"), index=False)
 
     images: List[np.ndarray] = []
-    fig_r, ax = plt.subplots(figsize=(6,3))
+    fig_r, ax = plt.subplots(figsize=(6, 3))
     ax.scatter(model.fittedvalues, model.resid_deviance)
     ax.axhline(0, linestyle=":")
-    ax.set_xlabel("Fitted"); ax.set_ylabel("Residuals"); ax.set_title(f"Residuals vs Fitted (GLM: {family})")
+    ax.set_xlabel("Fitted")
+    ax.set_ylabel("Residuals")
+    ax.set_title(f"Residuals vs Fitted (GLM: {family})")
     images.append(fig_to_np(fig_r))
 
     sm.qqplot(model.resid_deviance, line="45", fit=True)
     images.append(fig_to_np(plt.gcf()))
-
     return str(model.summary()), images
 
+
 # ---------- NEW ANALYSES ----------
-def chisq_test(df: pd.DataFrame, row: str, col: str, exact: bool=False) -> Tuple[str, List[np.ndarray]]:
+def chisq_test(df: pd.DataFrame, row: str, col: str, exact: bool = False) -> Tuple[str, List[np.ndarray]]:
     tab = pd.crosstab(df[row], df[col], dropna=True)
     n = tab.values.sum()
-    if tab.shape == (2,2) and exact:
+    if tab.shape == (2, 2) and exact:
         oddsratio, p = stats.fisher_exact(tab.values)
         method = "Fisher's exact (2x2)"
         chi2 = np.nan
     else:
         chi2, p, dof, exp = stats.chi2_contingency(tab.values)
         method = f"Chi-square test (dof={dof})"
+
     r, c = tab.shape
     if r > 1 and c > 1 and not np.isnan(chi2):
-        V = np.sqrt(chi2 / (n * (min(r-1, c-1))))
+        V = np.sqrt(chi2 / (n * (min(r - 1, c - 1))))
     else:
         V = np.nan
-    lines = [
-        f"{method} on {row} × {col}",
-        f"Table (n={n}):",
-        str(tab),
-    ]
+
+    lines = [f"{method} on {row} × {col}", f"Table (n={n}):", str(tab)]
     if not np.isnan(chi2):
         lines.append(f"χ² = {chi2:.4g}, p = {p:.5g}, Cramér's V = {V:.3g}")
     else:
         lines.append(f"p = {p:.5g} (Fisher)")
+
     # Stacked bar plot (column proportions)
-    fig, ax = plt.subplots(figsize=(6,3))
+    fig, ax = plt.subplots(figsize=(6, 3))
     cols = list(tab.columns)
     ind = np.arange(len(cols))
     bottom = np.zeros(len(cols))
@@ -650,103 +881,120 @@ def chisq_test(df: pd.DataFrame, row: str, col: str, exact: bool=False) -> Tuple
         props = vals / vals.sum() if vals.sum() > 0 else vals
         ax.bar(ind, props, bottom=bottom, label=str(level))
         bottom += props
-    ax.set_xticks(ind); ax.set_xticklabels(cols)
+    ax.set_xticks(ind)
+    ax.set_xticklabels(cols)
     ax.set_ylabel("Proportion")
     ax.set_title(f"{row} proportions within {col}")
     ax.legend(fontsize=8, ncols=min(3, len(tab.index)))
     img = fig_to_np(fig)
+
     return "\n".join(lines), [img]
 
-def pearson_ci(r: float, n: int, alpha: float=0.05) -> Tuple[float, float]:
+
+def pearson_ci(r: float, n: int, alpha: float = 0.05) -> Tuple[float, float]:
     if n <= 3 or np.isclose(abs(r), 1.0):
         return (np.nan, np.nan)
     z = np.arctanh(r)
-    se = 1/np.sqrt(n-3)
-    zcrit = stats.norm.ppf(1 - alpha/2)
-    lo = np.tanh(z - zcrit*se)
-    hi = np.tanh(z + zcrit*se)
+    se = 1 / np.sqrt(n - 3)
+    zcrit = stats.norm.ppf(1 - alpha / 2)
+    lo = np.tanh(z - zcrit * se)
+    hi = np.tanh(z + zcrit * se)
     return lo, hi
 
-def corr_pair(df: pd.DataFrame, x: str, y: str, method: str="pearson") -> Tuple[str, List[np.ndarray]]:
-    s = df[[x,y]].dropna()
+
+def corr_pair(df: pd.DataFrame, x: str, y: str, method: str = "pearson") -> Tuple[str, List[np.ndarray]]:
+    s = df[[x, y]].dropna()
     if len(s) < 2:
         raise gr.Error("Not enough paired data for correlation.")
+
     if method.lower() == "spearman":
         corr, p = stats.spearmanr(s[x], s[y])
         ci = (np.nan, np.nan)
     else:
         corr, p = stats.pearsonr(s[x], s[y])
         ci = pearson_ci(corr, len(s))
+
     lines = [f"{method.title()} correlation between {x} and {y}", f"n={len(s)}, r = {corr:.4g}, p = {p:.5g}"]
     if not np.isnan(ci[0]):
         lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
-    fig, ax = plt.subplots(figsize=(6,3))
-    ax.scatter(s[x], s[y])
-    if method.lower() == "pearson" and len(s) >= 2:
-        order = np.argsort(s[x].values)
-        ax.plot(s[x].values[order], np.poly1d(np.polyfit(s[x].values, s[y].values, 1))(s[x].values)[order])
-    ax.set_xlabel(x); ax.set_ylabel(y); ax.set_title(f"{method.title()} scatter")
-    img = fig_to_np(fig)
-    return "\n".join(lines), [img]
 
-def corr_matrix_plot(df: pd.DataFrame, cols: Optional[List[str]]=None, method: str="pearson") -> Tuple[str, List[np.ndarray]]:
+    fig_img = scatter_with_reg(s, x=x, y=y, ci=0.95, title=f"{method.title()} scatter")
+    return "\n".join(lines), [fig_img]
+
+
+def corr_matrix_plot(df: pd.DataFrame, cols: Optional[List[str]] = None, method: str = "pearson") -> Tuple[str, List[np.ndarray]]:
     if cols is None or len(cols) < 2:
         cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     mat = df[cols].corr(method=method)
     mat.to_csv(os.path.join(outputs_dir, f"corr_matrix_{method}.csv"))
-    fig, ax = plt.subplots(figsize=(6,5))
-    cax = ax.imshow(mat.values, aspect='auto')
-    ax.set_xticks(np.arange(len(cols))); ax.set_xticklabels(cols, rotation=45, ha="right")
-    ax.set_yticks(np.arange(len(cols))); ax.set_yticklabels(cols)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    cax = ax.imshow(mat.values, aspect="auto")
+    ax.set_xticks(np.arange(len(cols)))
+    ax.set_xticklabels(cols, rotation=45, ha="right")
+    ax.set_yticks(np.arange(len(cols)))
+    ax.set_yticklabels(cols)
     ax.set_title(f"{method.title()} correlation matrix")
     fig.colorbar(cax, ax=ax, fraction=0.046, pad=0.04)
     img = fig_to_np(fig)
     txt = f"{method.title()} correlation matrix on: {', '.join(cols)}\n\n{mat.round(3).to_string()}"
     return txt, [img]
 
+
 def mann_whitney(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
     gorder = ordered_groups(df, group)
     if len(gorder) != 2:
         raise gr.Error(f"Mann–Whitney U requires exactly 2 groups; {group} has {len(gorder)} levels.")
+
     a = df[df[group].astype(str) == gorder[0]][value].dropna().astype(float).values
     b = df[df[group].astype(str) == gorder[1]][value].dropna().astype(float).values
+
     U, p = stats.mannwhitneyu(a, b, alternative="two-sided")
     n1, n2 = len(a), len(b)
-    A = U/(n1*n2) if n1>0 and n2>0 else np.nan
-    r_rb = 2*A - 1 if not np.isnan(A) else np.nan
+    A = U / (n1 * n2) if n1 > 0 and n2 > 0 else np.nan
+    r_rb = 2 * A - 1 if not np.isnan(A) else np.nan
+
     txt = [
         f"Mann–Whitney U on {value} by {group}",
         f"Groups: {gorder[0]} (n={n1}) vs {gorder[1]} (n={n2})",
-        f"U = {U:.4g}, p = {p:.5g}, rank-biserial r = {r_rb:.3g} (A = {A:.3g})"
+        f"U = {U:.4g}, p = {p:.5g}, rank-biserial r = {r_rb:.3g} (A = {A:.3g})",
     ]
-    fig_box, ax = plt.subplots(figsize=(5,3))
+
+    # Visuals
+    img_bar = bar_with_error_plot(df, value, group, error="sem", gorder=gorder)
+
+    # Matplotlib box/violin (house style still applies)
+    fig_box, ax = plt.subplots(figsize=(5, 3))
     ax.boxplot([a, b], tick_labels=[gorder[0], gorder[1]])
     ax.set_title(f"Boxplot of {value} by {group}")
     img_box = fig_to_np(fig_box)
 
-    fig_vio, ax = plt.subplots(figsize=(5,3))
+    fig_vio, ax = plt.subplots(figsize=(5, 3))
     ax.violinplot([a, b], showmeans=True)
-    ax.set_xticks([1,2]); ax.set_xticklabels([gorder[0], gorder[1]])
+    ax.set_xticks([1, 2])
+    ax.set_xticklabels([gorder[0], gorder[1]])
     ax.set_title(f"Violin of {value} by {group}")
     img_vio = fig_to_np(fig_vio)
 
-    img_bar = bar_with_error_plot(df, value, group, error="sem", gorder=gorder)
-
     return "\n".join(txt), [img_bar, img_box, img_vio]
 
+
 def wilcoxon_signed(df: pd.DataFrame, a: str, b: str) -> Tuple[str, List[np.ndarray]]:
-    s = df[[a,b]].dropna().astype(float)
+    s = df[[a, b]].dropna().astype(float)
     if len(s) < 3:
         raise gr.Error("Wilcoxon signed-rank needs at least 3 paired observations.")
     stat, p = stats.wilcoxon(s[a], s[b], zero_method="wilcox", alternative="two-sided")
     txt = f"Wilcoxon signed-rank on paired columns {a} vs {b}\nn={len(s)}, W = {stat:.4g}, p = {p:.5g}"
-    fig, ax = plt.subplots(figsize=(6,3))
+
+    fig, ax = plt.subplots(figsize=(6, 3))
     ax.scatter(s[a], s[b])
     lim = [min(s[a].min(), s[b].min()), max(s[a].max(), s[b].max())]
     ax.plot(lim, lim, linestyle=":")
-    ax.set_xlabel(a); ax.set_ylabel(b); ax.set_title("Paired scatter (y=x reference)")
+    ax.set_xlabel(a)
+    ax.set_ylabel(b)
+    ax.set_title("Paired scatter (y=x reference)")
     img = fig_to_np(fig)
     return txt, [img]
+
 
 def kruskal_wallis(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
     gorder = ordered_groups(df, group)
@@ -759,19 +1007,21 @@ def kruskal_wallis(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[
     eps2 = (H - k + 1) / (n - k) if n > k else np.nan
     txt = f"Kruskal–Wallis on {value} by {group}\nGroups: {', '.join(gorder)}\nH = {H:.4g}, p = {p:.5g}, ε² = {eps2:.3g}"
 
-    fig_box, ax = plt.subplots(figsize=(6,3))
+    fig_box, ax = plt.subplots(figsize=(6, 3))
     ax.boxplot(data, tick_labels=gorder)
     ax.set_title(f"Boxplot of {value} by {group}")
     img_box = fig_to_np(fig_box)
 
-    fig_vio, ax = plt.subplots(figsize=(6,3))
+    fig_vio, ax = plt.subplots(figsize=(6, 3))
     ax.violinplot(data, showmeans=True)
-    ax.set_xticks(range(1, len(gorder)+1)); ax.set_xticklabels(gorder)
-    ax.set_title(f"Violin of {value} by {group}")
+    ax.set_xticks(range(1, len(gorder) + 1))
+    ax.set_xticklabels(gorder)
     img_vio = fig_to_np(fig_vio)
+
     return txt, [img_box, img_vio]
 
-def levene_test(df: pd.DataFrame, value: str, group: str, center: str="median") -> Tuple[str, List[np.ndarray]]:
+
+def levene_test(df: pd.DataFrame, value: str, group: str, center: str = "median") -> Tuple[str, List[np.ndarray]]:
     gorder = ordered_groups(df, group)
     data = [df[df[group].astype(str) == g][value].dropna().astype(float).values for g in gorder]
     if len(data) < 2:
@@ -779,6 +1029,7 @@ def levene_test(df: pd.DataFrame, value: str, group: str, center: str="median") 
     W, p = stats.levene(*data, center=center)
     txt = f"Levene’s test for equal variances on {value} by {group}\ncenter={center}, W = {W:.4g}, p = {p:.5g}"
     return txt, []
+
 
 # ---------- POST-HOC TESTS ----------
 def tukey_hsd(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
@@ -790,6 +1041,7 @@ def tukey_hsd(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.nd
     cols = [c.strip() for c in summ.data[0]]
     tukey_df = pd.DataFrame(data, columns=cols)
     tukey_df.to_csv(os.path.join(outputs_dir, "tukey_hsd_results.csv"), index=False)
+
     # Means + 95% CI plot per group
     gorder = ordered_groups(d, group)
     means, ci_lo, ci_hi = [], [], []
@@ -798,18 +1050,30 @@ def tukey_hsd(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.nd
         n = len(vals)
         m = np.mean(vals) if n else np.nan
         sd = np.std(vals, ddof=1) if n > 1 else np.nan
-        se = sd/np.sqrt(n) if n else np.nan
-        tcrit = stats.t.ppf(0.975, df=n-1) if n > 1 else np.nan
-        lo, hi = (m - tcrit*se, m + tcrit*se) if (se is not None and tcrit is not None) else (np.nan, np.nan)
-        means.append(m); ci_lo.append(lo); ci_hi.append(hi)
+        se = sd / np.sqrt(n) if n else np.nan
+        tcrit = stats.t.ppf(0.975, df=n - 1) if n > 1 else np.nan
+        lo, hi = (m - tcrit * se, m + tcrit * se) if (se is not None and tcrit is not None) else (np.nan, np.nan)
+        means.append(m)
+        ci_lo.append(lo)
+        ci_hi.append(hi)
+
     x = np.arange(len(gorder))
-    fig, ax = plt.subplots(figsize=(7,3))
-    ax.errorbar(x, means, yerr=[np.array(means)-np.array(ci_lo), np.array(ci_hi)-np.array(means)], fmt='o', capsize=5)
-    ax.set_xticks(x); ax.set_xticklabels(gorder)
-    ax.set_title(f"Tukey HSD (plot shows group means with 95% t-CIs)")
+    fig, ax = plt.subplots(figsize=(7, 3))
+    ax.errorbar(
+        x,
+        means,
+        yerr=[np.array(means) - np.array(ci_lo), np.array(ci_hi) - np.array(means)],
+        fmt="o",
+        capsize=5,
+    )
+    ax.set_xticks(x)
+    ax.set_xticklabels(gorder)
+    ax.set_title("Tukey HSD (plot shows group means with 95% t-CIs)")
     img = fig_to_np(fig)
+
     txt = "Tukey HSD pairwise comparisons (α=0.05)\n" + tukey_df.to_string(index=False)
     return txt, [img]
+
 
 def _holm_adjust(pvals: List[float]) -> List[float]:
     m = len(pvals)
@@ -823,7 +1087,8 @@ def _holm_adjust(pvals: List[float]) -> List[float]:
         prev = adj_i
     return adj.tolist()
 
-def dunn_posthoc(df: pd.DataFrame, value: str, group: str, p_adjust: str="holm") -> Tuple[str, List[np.ndarray]]:
+
+def dunn_posthoc(df: pd.DataFrame, value: str, group: str, p_adjust: str = "holm") -> Tuple[str, List[np.ndarray]]:
     d = df[[value, group]].dropna()
     d = d.astype({value: float})
     if sp is not None:
@@ -831,9 +1096,11 @@ def dunn_posthoc(df: pd.DataFrame, value: str, group: str, p_adjust: str="holm")
         ptab.to_csv(os.path.join(outputs_dir, f"dunn_{p_adjust}_pvalues.csv"))
         txt = f"Dunn’s post-hoc (p-adjust={p_adjust}) after Kruskal–Wallis\n" + ptab.round(4).to_string()
         return txt, []
+
     # Fallback: pairwise Mann–Whitney + Holm adjust
-    levels = ordered_groups(d, group)
     from itertools import combinations
+
+    levels = ordered_groups(d, group)
     pairs, raw_p = [], []
     for a, b in combinations(levels, 2):
         va = d[d[group].astype(str) == a][value].values
@@ -842,31 +1109,46 @@ def dunn_posthoc(df: pd.DataFrame, value: str, group: str, p_adjust: str="holm")
             p = np.nan
         else:
             p = stats.mannwhitneyu(va, vb, alternative="two-sided").pvalue
-        pairs.append((a,b)); raw_p.append(p)
+        pairs.append((a, b))
+        raw_p.append(p)
+
     finite_mask = np.isfinite(raw_p)
-    adj_p = [np.nan]*len(raw_p)
+    adj_p = [np.nan] * len(raw_p)
     if finite_mask.any():
         finite_vals = [raw_p[i] for i in range(len(raw_p)) if finite_mask[i]]
         adj_vals = _holm_adjust(finite_vals)
         j = 0
         for i in range(len(raw_p)):
             if finite_mask[i]:
-                adj_p[i] = adj_vals[j]; j += 1
-    rows = [{"group1":a, "group2":b, "p_raw":p, "p_adj_holm":pa} for (a,b), p, pa in zip(pairs, raw_p, adj_p)]
+                adj_p[i] = adj_vals[j]
+                j += 1
+
+    rows = [
+        {"group1": a, "group2": b, "p_raw": p, "p_adj_holm": pa}
+        for (a, b), p, pa in zip(pairs, raw_p, adj_p)
+    ]
     out = pd.DataFrame(rows)
     out.to_csv(os.path.join(outputs_dir, "dunn_fallback_mwu_holm.csv"), index=False)
-    txt = "Dunn’s post-hoc (approx via pairwise Mann–Whitney + Holm; install scikit-posthocs for exact Dunn)\n" + out.round(4).to_string(index=False)
+    txt = (
+        "Dunn’s post-hoc (approx via pairwise Mann–Whitney + Holm; install scikit-posthocs for exact Dunn)\n"
+        + out.round(4).to_string(index=False)
+    )
     return txt, []
 
+
 # ---------- PARTIAL & POINT-BISERIAL ----------
-def partial_corr(df: pd.DataFrame, x: str, y: str, controls: List[str], method: str="pearson") -> Tuple[str, List[np.ndarray]]:
+def partial_corr(
+    df: pd.DataFrame, x: str, y: str, controls: List[str], method: str = "pearson"
+) -> Tuple[str, List[np.ndarray]]:
     cols = [x, y] + list(controls)
     d = df[cols].dropna()
     if len(d) < (len(controls) + 3):
         raise gr.Error("Not enough rows for partial correlation (need > controls + 2).")
+
     if method.lower() == "spearman":
         for c in cols:
             d[c] = d[c].rank(method="average")
+
     Xc = sm.add_constant(d[controls])
     rx = sm.OLS(d[x].astype(float), Xc).fit().resid
     ry = sm.OLS(d[y].astype(float), Xc).fit().resid
@@ -874,20 +1156,26 @@ def partial_corr(df: pd.DataFrame, x: str, y: str, controls: List[str], method: 
     n = len(d)
     k = len(controls)
     ci = pearson_ci(r, n - k)
+
     lines = [
         f"Partial correlation ({method.title()}) between {x} and {y} controlling for {', '.join(controls)}",
         f"n={n}, k={k} controls, r = {r:.4g}, p = {p:.5g}",
     ]
     if not np.isnan(ci[0]):
         lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
-    fig, ax = plt.subplots(figsize=(6,3))
+
+    fig, ax = plt.subplots(figsize=(6, 3))
     ax.scatter(rx, ry)
     m, b = np.polyfit(rx, ry, 1)
     xs = np.linspace(rx.min(), rx.max(), 100)
-    ax.plot(xs, m*xs + b)
-    ax.set_xlabel(f"{x} residuals"); ax.set_ylabel(f"{y} residuals"); ax.set_title("Partial correlation (residuals)")
+    ax.plot(xs, m * xs + b)
+    ax.set_xlabel(f"{x} residuals")
+    ax.set_ylabel(f"{y} residuals")
+    ax.set_title("Partial correlation (residuals)")
     img = fig_to_np(fig)
+
     return "\n".join(lines), [img]
+
 
 def point_biserial(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[np.ndarray]]:
     g = df[group]
@@ -900,8 +1188,9 @@ def point_biserial(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[
         levels = pd.unique(g.dropna())
         if len(levels) != 2:
             raise gr.Error(f"{group} must have exactly two levels for point-biserial.")
-        mapping = {str(levels[0]):0.0, str(levels[1]):1.0}
+        mapping = {str(levels[0]): 0.0, str(levels[1]): 1.0}
         gb = g.astype(str).map(mapping)
+
     d = pd.DataFrame({value: df[value], "_gb": gb}).dropna()
     if len(d) < 3:
         raise gr.Error("Not enough data for point-biserial.")
@@ -910,80 +1199,55 @@ def point_biserial(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[
     except Exception:
         r, p = stats.pearsonr(d["_gb"].values, d[value].astype(float).values)
     ci = pearson_ci(r, len(d))
+
     lines = [f"Point-biserial correlation between {value} and {group}", f"n={len(d)}, r = {r:.4g}, p = {p:.5g}"]
     if not np.isnan(ci[0]):
         lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
+
     gorder = ordered_groups(df, group)
     title, img_box = plot_box(df, value, group)
     img_bar = bar_with_error_plot(df, value, group, error="sem", gorder=gorder)
     return "\n".join(lines), [img_bar, img_box]
 
+
 # ---------- PLOTS & CHECKS ----------
 def plot_hist(df: pd.DataFrame, col: str, bins: int = 30) -> Tuple[str, np.ndarray]:
     s = df[col].dropna().astype(float)
-    fig, ax = plt.subplots(figsize=(6,3))
-    ax.hist(s, bins=bins)
+    fig, ax = plt.subplots(figsize=(6, 3))
+    sns.histplot(s, bins=bins, ax=ax)
     ax.set_title(f"Histogram of {col}")
-    return f"Histogram {col}", fig_to_np(fig)
+    fig.tight_layout()
+    return f"Histogram {col}", _render(fig)
+
 
 def plot_box(df: pd.DataFrame, value: str, group: str) -> Tuple[str, np.ndarray]:
-    gorder = ordered_groups(df, group)
-    data = [df[df[group].astype(str) == g][value].dropna().astype(float).values for g in gorder]
-    fig, ax = plt.subplots(figsize=(6,3))
-    ax.boxplot(data, tick_labels=gorder)
-    ax.set_title(f"Boxplot of {value} by {group}")
-    return f"Boxplot {value}~{group}", fig_to_np(fig)
+    img = box_plot(df, value, group)
+    return f"Boxplot {value}~{group}", img
+
 
 def plot_violin(df: pd.DataFrame, value: str, group: str) -> Tuple[str, np.ndarray]:
-    gorder = ordered_groups(df, group)
-    data = [df[df[group].astype(str) == g][value].dropna().astype(float).values for g in gorder]
-    fig, ax = plt.subplots(figsize=(6,3))
-    ax.violinplot(data, showmeans=True)
-    ax.set_xticks(range(1, len(gorder)+1))
-    ax.set_xticklabels(gorder)
-    ax.set_title(f"Violin of {value} by {group}")
-    return f"Violin {value}~{group}", fig_to_np(fig)
+    img = violin_plot(df, value, group)
+    return f"Violin {value}~{group}", img
 
-def bar_with_error_plot(df: pd.DataFrame, value: str, group: str, error: str = "sem", gorder: Optional[List[str]] = None) -> np.ndarray:
-    if gorder is None:
-        gorder = ordered_groups(df, group)
-    means, errs = [], []
-    for g in gorder:
-        vals = df[df[group].astype(str) == g][value].dropna().astype(float).values
-        n = len(vals)
-        m = vals.mean() if n > 0 else np.nan
-        if error == "sd":
-            e = vals.std(ddof=1) if n > 1 else np.nan
-        elif error == "ci95":
-            sd = vals.std(ddof=1) if n > 1 else np.nan
-            se = sd/np.sqrt(n) if n > 0 else np.nan
-            tcrit = stats.t.ppf(0.975, df=n-1) if n > 1 else np.nan
-            e = se * tcrit if (se is not None and tcrit is not None) else np.nan
-        else:  # sem
-            sd = vals.std(ddof=1) if n > 1 else np.nan
-            e = sd/np.sqrt(n) if n > 0 else np.nan
-        means.append(m); errs.append(e)
-    x = np.arange(len(gorder))
-    fig, ax = plt.subplots(figsize=(6,3))
-    ax.bar(x, means, yerr=errs, capsize=4)
-    ax.set_xticks(x); ax.set_xticklabels(gorder)
-    err_label = str(error).upper()
-    ax.set_title(f"Bar ± {err_label} of {value} by {group}")
-    return fig_to_np(fig)
 
 def check_normality(df: pd.DataFrame, col: str) -> Tuple[str, np.ndarray]:
     series = df[col].dropna().astype(float)
     W, p = (stats.shapiro(series) if 3 <= len(series) <= 5000 else (np.nan, np.nan))
-    msg = f"Shapiro–Wilk normality on {col} (n={len(series)}): W={W:.4g}, p={p:.5g}" if not np.isnan(W) else f"Shapiro–Wilk skipped for {col} (requires 3–5000 values)."
+    msg = (
+        f"Shapiro–Wilk normality on {col} (n={len(series)}): W={W:.4g}, p={p:.5g}"
+        if not np.isnan(W)
+        else f"Shapiro–Wilk skipped for {col} (requires 3–5000 values)."
+    )
     sm.qqplot(series, line="45", fit=True)
     return msg, fig_to_np(plt.gcf())
+
 
 # ---------- POWER ----------
 def power_ttest_ind(effect_size: Optional[float], alpha: float, power: Optional[float], ratio: float, solve_for: str) -> str:
     tool = TTestIndPower()
     if solve_for == "n_total":
         n1 = tool.solve_power(effect_size=effect_size, power=power, alpha=alpha, ratio=ratio, alternative="two-sided")
-        n2 = n1*ratio
+        n2 = n1 * ratio
         return f"Required total sample size (two-sample t-test): group1 ≈ {int(np.ceil(n1))}, group2 ≈ {int(np.ceil(n2))} (total ≈ {int(np.ceil(n1+n2))})"
     elif solve_for == "power":
         pw = tool.solve_power(effect_size=effect_size, nobs1=power, alpha=alpha, ratio=ratio, alternative="two-sided")
@@ -993,6 +1257,7 @@ def power_ttest_ind(effect_size: Optional[float], alpha: float, power: Optional[
         return f"Implied effect size d ≈ {es:.3f}"
     else:
         return "Unknown solve_for for t-test power."
+
 
 def power_anova_oneway(effect_size: Optional[float], k_groups: int, alpha: float, power: Optional[float], solve_for: str) -> str:
     tool = FTestAnovaPower()
@@ -1013,6 +1278,7 @@ def power_anova_oneway(effect_size: Optional[float], k_groups: int, alpha: float
     else:
         return "Unknown solve_for for ANOVA power."
 
+
 # ---------- QUICK SUMMARY ----------
 def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
     if by and by in df.columns and by != col and df[by].nunique(dropna=True) > 1:
@@ -1023,25 +1289,33 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
             if len(s) == 0:
                 lines.append(f"- {g}: n=0")
             else:
-                lines.append(f"- {g}: n={len(s)}, mean={s.mean():.4g}, sd={s.std(ddof=1):.4g}, min={s.min():.4g}, max={s.max():.4g}")
+                lines.append(
+                    f"- {g}: n={len(s)}, mean={s.mean():.4g}, sd={s.std(ddof=1):.4g}, min={s.min():.4g}, max={s.max():.4g}"
+                )
         return "\n".join(lines)
     else:
         s = df[col].dropna().astype(float)
         return f"Summary of {col}: n={len(s)}, mean={s.mean():.4g}, sd={s.std(ddof=1):.4g}, min={s.min():.4g}, max={s.max():.4g}"
 
-# ---------- LLM + LOCAL PARSER ----------
+
+# --------------------------
+# LLM + LOCAL PARSER
+# --------------------------
 def ask_llm(chat_history, user_input):
-    messages = [{"role":"system","content":SYSTEM_PROMPT}] + chat_history + [{"role":"user","content":user_input}]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history + [{"role": "user", "content": user_input}]
     resp = llm.chat(messages=messages, temperature=0.0, max_tokens=256, stream=False)
     try:
         call = json.loads(resp)
         return call, resp
     except Exception:
         conv = llm.chat(
-            messages=[{"role":"system","content":FALLBACK_PROMPT}] + messages,
-            temperature=0.7, max_tokens=256, stream=False
+            messages=[{"role": "system", "content": FALLBACK_PROMPT}] + messages,
+            temperature=0.7,
+            max_tokens=256,
+            stream=False,
         )
         return None, conv
+
 
 def _split_controls(s: str) -> List[str]:
     if not s:
@@ -1049,115 +1323,154 @@ def _split_controls(s: str) -> List[str]:
     parts = re.split(r"[,+]", s)
     return [p.strip() for p in parts if p.strip()]
 
+
 def local_parse(user_input: str) -> Optional[Dict]:
     s = user_input.strip().lower()
 
     if re.search(r"\b(what can i do|how should i analyze|recommend|suggestion|what analyses)\b", s):
-        return {"tool":"stats","action":"recommend","args":{}}
+        return {"tool": "stats", "action": "recommend", "args": {}}
 
-    m = re.search(r"(?:what(?:'s| is) the )?(?:mean|average|summary|summarize|describe)\s+([a-zA-Z0-9_]+)(?:\s+by\s+([a-zA-Z0-9_]+))?", s)
+    m = re.search(
+        r"(?:what(?:'s| is) the )?(?:mean|average|summary|summarize|describe)\s+([a-zA-Z0-9_]+)(?:\s+by\s+([a-zA-Z0-9_]+))?",
+        s,
+    )
     if m:
-        col = m.group(1); by = m.group(2) if m.group(2) else None
-        return {"tool":"stats","action":"summary","args":{"col":col, "by":by}}
+        col = m.group(1)
+        by = m.group(2) if m.group(2) else None
+        return {"tool": "stats", "action": "summary", "args": {"col": col, "by": by}}
 
     m = re.search(r"(t[\-\s]?test).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"ttest","args":{"value":m.group(2), "group":m.group(3)}}
+        return {"tool": "stats", "action": "ttest", "args": {"value": m.group(2), "group": m.group(3)}}
 
     m = re.search(r"(anova).*(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"anova","args":{"value":m.group(2), "group":m.group(3)}}
+        return {"tool": "stats", "action": "anova", "args": {"value": m.group(2), "group": m.group(3)}}
 
     # Post-hoc Tukey
-    m = re.search(r"(tukey|hsd|post[\-\s]*hoc).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
+    m = re.search(
+        r"(?:tukey|hsd|post[\-\s]*hoc)(?:\s+test)?\s+(?:on|of|for)\s+([a-zA-Z0-9_]+)\s+(?:by|across|vs)\s+([a-zA-Z0-9_]+)",
+        s,
+    )
     if m:
-        return {"tool":"stats","action":"posthoc_tukey","args":{"value":m.group(2), "group":m.group(3)}}
+        return {"tool": "stats", "action": "posthoc_tukey", "args": {"value": m.group(1), "group": m.group(2)}}
 
     # Kruskal–Wallis
-    m = re.search(r"(kruskal|kw).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
+    m = re.search(r"(kruskal|kw)(?:\s+test)?\s+(?:on|of|for)\s+([a-zA-Z0-9_]+)\s+(?:by|across)\s+([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"kruskal","args":{"value":m.group(2), "group":m.group(3)}}
+        return {"tool": "stats", "action": "kruskal", "args": {"value": m.group(2), "group": m.group(3)}}
 
-    # Post-hoc Dunn
-    m = re.search(r"(dunn).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
+    # Dunn
+    m = re.search(r"(dunn)(?:\s+test)?\s+(?:on|of|for)\s+([a-zA-Z0-9_]+)\s+(?:by|across)\s+([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"posthoc_dunn","args":{"value":m.group(2), "group":m.group(3), "p_adjust":"holm"}}
+        return {
+            "tool": "stats",
+            "action": "posthoc_dunn",
+            "args": {"value": m.group(2), "group": m.group(3), "p_adjust": "holm"},
+        }
 
     # Chi-square / Fisher
-    m = re.search(r"(chi(?:-?square)?|chi2|chisq|fisher).*?(?:of|between|for)?\s*([a-zA-Z0-9_]+)\s*(?:by|x|vs|versus|and)\s*([a-zA-Z0-9_]+)", s)
+    m = re.search(
+        r"(chi(?:-?square)?|chi2|chisq|fisher).*?(?:of|between|for)?\s*([a-zA-Z0-9_]+)\s*(?:by|x|vs|versus|and)\s*([a-zA-Z0-9_]+)",
+        s,
+    )
     if m:
         exact = "fisher" in m.group(1)
-        return {"tool":"stats","action":"chisq","args":{"row":m.group(2), "col":m.group(3), "exact":exact}}
+        return {"tool": "stats", "action": "chisq", "args": {"row": m.group(2), "col": m.group(3), "exact": exact}}
 
     # Correlation (pair)
-    m = re.search(r"(pearson|spearman|correlation|correlate).*?(?:of|between)?\s*([a-zA-Z0-9_]+)\s*(?:and|&|,|vs|x)\s*([a-zA-Z0-9_]+)", s)
+    m = re.search(
+        r"(pearson|spearman|correlation|correlate).*?(?:of|between)?\s*([a-zA-Z0-9_]+)\s*(?:and|&|,|vs|x)\s*([a-zA-Z0-9_]+)",
+        s,
+    )
     if m:
         method = "pearson" if "pearson" in m.group(1) else ("spearman" if "spearman" in m.group(1) else "pearson")
-        return {"tool":"stats","action":"corr","args":{"x":m.group(2), "y":m.group(3), "method":method, "matrix":False}}
+        return {
+            "tool": "stats",
+            "action": "corr",
+            "args": {"x": m.group(2), "y": m.group(3), "method": method, "matrix": False},
+        }
 
     # Correlation heatmap/matrix
     if re.search(r"(corr(?:elation)?\s*(matrix|heat\s*map|heatmap))", s):
-        return {"tool":"stats","action":"corr","args":{"matrix":True, "method":"pearson"}}
+        return {"tool": "stats", "action": "corr", "args": {"matrix": True, "method": "pearson"}}
 
     # Partial correlation
-    m = re.search(r"(pcorr|partial\s+correlation).*?([a-zA-Z0-9_]+)\s*(?:and|&|,|vs|~)\s*([a-zA-Z0-9_]+)(?:.*?(?:\||controlling|adjusting|for)\s*([a-zA-Z0-9_\s\+,\.;:]+))?", s)
+    m = re.search(
+        r"(pcorr|partial\s+correlation).*?([a-zA-Z0-9_]+)\s*(?:and|&|,|vs|~)\s*([a-zA-Z0-9_]+)(?:.*?(?:\||controlling|adjusting|for)\s*([a-zA-Z0-9_\s\+,\.;:]+))?",
+        s,
+    )
     if m:
         x, y = m.group(2), m.group(3)
         ctrls = _split_controls(m.group(4) or "")
-        return {"tool":"stats","action":"pcorr","args":{"x":x, "y":y, "controls":ctrls, "method":"pearson"}}
+        return {"tool": "stats", "action": "pcorr", "args": {"x": x, "y": y, "controls": ctrls, "method": "pearson"}}
 
     # Point-biserial
     m = re.search(r"(point[\-\s]*biserial|pbiserial).*?(?:of|between|on)?\s*([a-zA-Z0-9_]+)\s*(?:by|with|and)\s*([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"pbiserial","args":{"value":m.group(2), "group":m.group(3)}}
+        return {"tool": "stats", "action": "pbiserial", "args": {"value": m.group(2), "group": m.group(3)}}
 
     # Mann–Whitney
     m = re.search(r"(mann[\-\s]?whitney|wilcoxon\s*rank\s*sum|rank\s*test).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"mwutest","args":{"value":m.group(2), "group":m.group(3)}}
+        return {"tool": "stats", "action": "mwutest", "args": {"value": m.group(2), "group": m.group(3)}}
 
     # Wilcoxon signed-rank (paired)
     m = re.search(r"(wilcoxon).*?([a-zA-Z0-9_]+)\s*(?:vs|and|,)\s*([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"wilcoxon","args":{"a":m.group(2), "b":m.group(3)}}
+        return {"tool": "stats", "action": "wilcoxon", "args": {"a": m.group(2), "b": m.group(3)}}
 
     # Levene
-    m = re.search(r"(levene).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)(?:.*center\s*=\s*(median|mean|trimmed))?", s)
+    m = re.search(
+        r"(levene).*?(?:on|of)?\s*([a-zA-Z0-9_]+).*(?:by|across)\s*([a-zA-Z0-9_]+)(?:.*center\s*=\s*(median|mean|trimmed))?",
+        s,
+    )
     if m:
         center = m.group(4) if m.group(4) else "median"
-        return {"tool":"stats","action":"levene","args":{"value":m.group(2), "group":m.group(3), "center":center}}
+        return {"tool": "stats", "action": "levene", "args": {"value": m.group(2), "group": m.group(3), "center": center}}
 
     m = re.search(r"(?:ols|regression)\s+([a-zA-Z0-9_]+)\s*~\s*([a-zA-Z0-9_+\s]+)", s)
     if m:
-        return {"tool":"stats","action":"ols","args":{"formula": f"{m.group(1)} ~ {m.group(2)}"}}
+        return {"tool": "stats", "action": "ols", "args": {"formula": f"{m.group(1)} ~ {m.group(2)}"}}
 
     m = re.search(r"(glm|poisson|binomial|gaussian|gamma)\s+([a-zA-Z0-9_]+)\s*~\s*([a-zA-Z0-9_+\s]+)", s)
     if m:
         fam = "gaussian" if m.group(1) == "glm" else m.group(1)
-        return {"tool":"stats","action":"glm","args":{"formula": f"{m.group(2)} ~ {m.group(3)}", "family":fam}}
+        return {"tool": "stats", "action": "glm", "args": {"formula": f"{m.group(2)} ~ {m.group(3)}", "family": fam}}
 
     m = re.search(r"(hist(?:ogram)?)\s+(?:of|on|for)?\s*([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"plot","args":{"hist":{"col":m.group(2),"bins":30}}}
+        return {"tool": "stats", "action": "plot", "args": {"hist": {"col": m.group(2), "bins": 30}}}
 
     m = re.search(r"(box|violin|bar)\s+(?:plot\s+)?(?:of|on|for)?\s*([a-zA-Z0-9_]+)\s+(?:by|across)\s*([a-zA-Z0-9_]+)", s)
     if m:
         kind, val, grp = m.group(1), m.group(2), m.group(3)
         if kind == "box":
-            return {"tool":"stats","action":"plot","args":{"box":{"value":val,"group":grp}}}
+            return {"tool": "stats", "action": "plot", "args": {"box": {"value": val, "group": grp}}}
         if kind == "violin":
-            return {"tool":"stats","action":"plot","args":{"violin":{"value":val,"group":grp}}}
+            return {"tool": "stats", "action": "plot", "args": {"violin": {"value": val, "group": grp}}}
         if kind == "bar":
-            return {"tool":"stats","action":"plot","args":{"bar":{"value":val,"group":grp,"error":"ci95"}}}
+            return {"tool": "stats", "action": "plot", "args": {"bar": {"value": val, "group": grp, "error": "ci95"}}}
 
     m = re.search(r"(normality|qq)\s+(?:check|plot)?\s*(?:for|of)?\s*([a-zA-Z0-9_]+)", s)
     if m:
-        return {"tool":"stats","action":"check","args":{"normality":{"col":"{}".format(m.group(2))}}}
+        return {"tool": "stats", "action": "check", "args": {"normality": {"col": "{}".format(m.group(2))}}}
 
     if "power" in s and "t-test" in s:
-        return {"tool":"stats","action":"power","args":{"ttest_ind":{"effect_size":0.5,"alpha":0.05,"power":0.8,"ratio":1.0,"solve_for":"n_total"}}}
+        return {
+            "tool": "stats",
+            "action": "power",
+            "args": {"ttest_ind": {"effect_size": 0.5, "alpha": 0.05, "power": 0.8, "ratio": 1.0, "solve_for": "n_total"}},
+        }
+
     if "power" in s and "anova" in s:
-        return {"tool":"stats","action":"power","args":{"anova_oneway":{"effect_size":0.25,"k_groups":3,"alpha":0.05,"power":0.8,"solve_for":"n_per_group"}}}
+        return {
+            "tool": "stats",
+            "action": "power",
+            "args": {
+                "anova_oneway": {"effect_size": 0.25, "k_groups": 3, "alpha": 0.05, "power": 0.8, "solve_for": "n_per_group"}
+            },
+        }
 
     try:
         maybe = json.loads(user_input)
@@ -1167,11 +1480,15 @@ def local_parse(user_input: str) -> Optional[Dict]:
         pass
     return None
 
-# ---------- USER-FRIENDLY CLARIFICATION ----------
+
+# --------------------------
+# USER-FRIENDLY CLARIFICATION
+# --------------------------
 def clarify_message(df: Optional[pd.DataFrame], llm_error_text: Optional[str], user_text: str) -> str:
     prefix = "Sorry — I didn’t understand that request."
     if llm_error_text:
         prefix = f"{prefix} {llm_error_text}"
+
     examples = [
         "What is the average score?",
         "Show a histogram of height.",
@@ -1183,26 +1500,43 @@ def clarify_message(df: Optional[pd.DataFrame], llm_error_text: Optional[str], u
         "Partial correlation height and score controlling for age, weight.",
         "Point-biserial score by sex.",
         "Chi-square sex by group.",
-        "Check normality of score (QQ plot)."
+        "Check normality of score (QQ plot).",
     ]
+
     if df is not None:
         try:
             tech, ex = recommend_text_and_examples(df)
-            return (
-                f"{prefix}\n\nCould you clarify what you want to do?\n\n"
-                f"{tech}\n\nSay it like this\n{ex}"
-            )
+            return f"{prefix}\n\nCould you clarify what you want to do?\n\n{tech}\n\nSay it like this\n{ex}"
         except Exception:
             pass
+
     cols = []
     if df is not None:
         cols = list(map(str, df.columns))
     col_text = f"\nDetected columns: {', '.join(cols)}" if cols else ""
-    return (
-        f"{prefix}\n\nTry one of these examples:\n• " + "\n• ".join(examples) + col_text
-    )
+    return f"{prefix}\n\nTry one of these examples:\n• " + "\n• ".join(examples) + col_text
 
-# ---------- CHAT HANDLERS ----------
+
+# --------------------------
+# GALLERY HELPERS
+# --------------------------
+def _safe_last(paths: List[str]) -> Tuple[Optional[str], List[str], int]:
+    if paths:
+        return paths[-1], paths, len(paths) - 1
+    return None, [], -1
+
+
+def _step(paths: List[str], idx: int, delta: int) -> Tuple[Optional[str], int]:
+    if not paths:
+        return None, -1
+    n = len(paths)
+    new_idx = (idx + delta) % n
+    return paths[new_idx], new_idx
+
+
+# --------------------------
+# CHAT HANDLERS
+# --------------------------
 def handle_upload(file):
     global cached_df
     clear_outputs()
@@ -1213,16 +1547,28 @@ def handle_upload(file):
         cols = ", ".join(map(str, df.columns))
         preview = df.head(200)
         return (
-            [{"role":"assistant","content":f"CSV uploaded. Columns detected: {cols}. Ask me for t-test, ANOVA (+ Tukey), Kruskal (+ Dunn), correlations/partial/pbiserial, chi-square/Fisher, rank tests, Levene’s, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'"}],
+            [
+                {
+                    "role": "assistant",
+                    "content": (
+                        "CSV uploaded. Columns detected: "
+                        f"{cols}. Ask me for t-test, ANOVA (+ Tukey), Kruskal (+ Dunn), "
+                        "correlations/partial/pbiserial, chi-square/Fisher, rank tests, Levene’s, "
+                        "OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, "
+                        "or 'what can I do with my data?'"
+                    ),
+                }
+            ],
             gr.update(value=preview, visible=True),
-            gr.update(visible=True)
+            gr.update(visible=True),
         )
     except Exception as e:
         return (
-            [{"role":"assistant","content":f"Failed to read CSV: {e}"}],
+            [{"role": "assistant", "content": f"Failed to read CSV: {e}"}],
             gr.update(visible=False),
-            gr.update(visible=False)
+            gr.update(visible=False),
         )
+
 
 def need_value_and_group(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     nums = usable_numeric_cols(df)
@@ -1231,26 +1577,13 @@ def need_value_and_group(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
         if df[c].nunique(dropna=True) >= 2:
             if not pd.api.types.is_numeric_dtype(df[c]) or is_integer_like(df[c]):
                 groups.append(c)
-    prefer = ["sex","group","treatment","class","category"]
-    ordered_groups = [c for c in prefer if c in groups] + [c for c in groups if c not in prefer]
-    return nums, ordered_groups
+    prefer = ["sex", "group", "treatment", "class", "category"]
+    ordered_g = [c for c in prefer if c in groups] + [c for c in groups if c not in prefer]
+    return nums, ordered_g
 
-# ---------- GALLERY (Prev/Next) ----------
-def _safe_last(paths: List[str]) -> Tuple[Optional[str], List[str], int]:
-    if paths:
-        return paths[-1], paths, len(paths) - 1
-    return None, [], -1
-
-def _step(paths: List[str], idx: int, delta: int) -> Tuple[Optional[str], int]:
-    if not paths:
-        return None, -1
-    n = len(paths)
-    new_idx = (idx + delta) % n
-    return paths[new_idx], new_idx
 
 def handle_chat(chat_history, user_message, data_preview):
     global cached_df, pending
-
     chat_history = list(chat_history)
     text = user_message.strip()
 
@@ -1272,24 +1605,45 @@ def handle_chat(chat_history, user_message, data_preview):
 
     if not parsed:
         msg = clarify_message(cached_df, llm_error_text, text)
-        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+        chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
         preview, paths, idx = _safe_last([])
-        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+        return (
+            chat_history,
+            gr.update(value=preview),
+            gr.update(value=None, visible=False),
+            data_preview,
+            paths,
+            idx,
+        )
 
     if parsed.get("tool") != "stats":
         msg = clarify_message(cached_df, llm_error_text, text)
-        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+        chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
         preview, paths, idx = _safe_last([])
-        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+        return (
+            chat_history,
+            gr.update(value=preview),
+            gr.update(value=None, visible=False),
+            data_preview,
+            paths,
+            idx,
+        )
 
     action = parsed.get("action")
     args = sanitize_args(action, parsed.get("args", {}))
 
     if cached_df is None:
         msg = "Please upload a CSV first."
-        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+        chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
         preview, paths, idx = _safe_last([])
-        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+        return (
+            chat_history,
+            gr.update(value=preview),
+            gr.update(value=None, visible=False),
+            data_preview,
+            paths,
+            idx,
+        )
 
     df = cached_df.copy()
     sections: List[Tuple[str, str, Optional[np.ndarray]]] = []
@@ -1301,10 +1655,18 @@ def handle_chat(chat_history, user_message, data_preview):
             tech, examples = recommend_text_and_examples(df)
             msg = "Recommendations\n" + tech + "\n\nSay it like this\n" + examples
             sections.append(("Recommendations", msg, None))
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
-            report_fp = write_report(sections); zip_fp = save_zip()
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
+            report_fp = write_report(sections)
+            zip_fp = save_zip()
             preview, paths, idx = _safe_last([])
-            return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx
+            return (
+                chat_history,
+                gr.update(value=preview),
+                gr.update(value=zip_fp, visible=True),
+                data_preview,
+                paths,
+                idx,
+            )
 
         # -------- Summary --------
         if action == "summary":
@@ -1316,332 +1678,651 @@ def handle_chat(chat_history, user_message, data_preview):
                 raise gr.Error(f"Group column '{by}' not found.")
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(msg)}])
-            report_fp = write_report(sections); zip_fp = save_zip()
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
+            report_fp = write_report(sections)
+            zip_fp = save_zip()
             preview, paths, idx = _safe_last([])
-            return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx
+            return (
+                chat_history,
+                gr.update(value=preview),
+                gr.update(value=zip_fp, visible=True),
+                data_preview,
+                paths,
+                idx,
+            )
 
         # -------- t-test --------
         if action == "ttest":
-            value = args.get("value"); group = args.get("group")
+            value = args.get("value")
+            group = args.get("group")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                pending.update({"action":"ttest","need":"value" if not value else "group","args":{"value":value,"group":group}})
-                ask = "Which numeric outcome should I test? Candidates: " + ", ".join(nums) if not value else "Which group column? Candidates: " + ", ".join(groups)
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                pending.update(
+                    {"action": "ttest", "need": "value" if not value else "group", "args": {"value": value, "group": group}}
+                )
+                ask = (
+                    "Which numeric outcome should I test? Candidates: " + ", ".join(nums)
+                    if not value
+                    else "Which group column? Candidates: " + ", ".join(groups)
+                )
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
             if value == group:
                 raise gr.Error("Outcome and group must be different.")
-            txt, imgs = run_ttest(df, value=value, group=group, paired=bool(args.get("paired", False)), equal_var=bool(args.get("equal_var", False)))
+
+            txt, imgs = run_ttest(
+                df, value=value, group=group, paired=bool(args.get("paired", False)), equal_var=bool(args.get("equal_var", False))
+            )
             sections.append(("t-test", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"ttest_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"ttest_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- ANOVA --------
         elif action == "anova":
-            value = args.get("value"); group = args.get("group")
+            value = args.get("value")
+            group = args.get("group")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                pending.update({"action":"anova","need":"value" if not value else "group","args":{"value":value,"group":group}})
-                ask = "Which numeric outcome for ANOVA? Candidates: " + ", ".join(nums) if not value else "Which group column for ANOVA? Candidates: " + ", ".join(groups)
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                pending.update(
+                    {"action": "anova", "need": "value" if not value else "group", "args": {"value": value, "group": group}}
+                )
+                ask = (
+                    "Which numeric outcome for ANOVA? Candidates: " + ", ".join(nums)
+                    if not value
+                    else "Which group column for ANOVA? Candidates: " + ", ".join(groups)
+                )
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
             if value == group:
                 raise gr.Error("Outcome and group must be different.")
             if df[group].nunique(dropna=True) < 2:
                 raise gr.Error(f"ANOVA needs ≥2 groups; '{group}' has {df[group].nunique(dropna=True)}.")
+
             txt, imgs = run_anova(df, value=value, group=group)
             sections.append(("ANOVA", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"anova_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"anova_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- POSTHOC: TUKEY --------
         elif action == "posthoc_tukey":
-            value = args.get("value"); group = args.get("group")
+            value = args.get("value")
+            group = args.get("group")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Tukey? Candidates: " + ", ".join(nums)) if not value \
-                      else ("Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                ask = (
+                    "Which numeric outcome for Tukey? Candidates: " + ", ".join(nums)
+                    if not value
+                    else "Which group column (≥2 levels)? Candidates: " + ", ".join(groups)
+                )
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
+            if value not in df.columns:
+                raise gr.Error(f"Column '{value}' not found.")
+            if group not in df.columns:
+                raise gr.Error(f"Group column '{group}' not found.")
+
             txt, imgs = tukey_hsd(df, value=value, group=group)
             sections.append(("Post-hoc: Tukey HSD", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"tukey_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"tukey_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- KRUSKAL --------
         elif action == "kruskal":
-            value = args.get("value"); group = args.get("group")
+            value = args.get("value")
+            group = args.get("group")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Kruskal–Wallis? Candidates: " + ", ".join(nums)) if not value \
-                      else ("Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                ask = (
+                    "Which numeric outcome for Kruskal–Wallis? Candidates: " + ", ".join(nums)
+                    if not value
+                    else "Which group column (≥2 levels)? Candidates: " + ", ".join(groups)
+                )
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
             txt, imgs = kruskal_wallis(df, value=value, group=group)
             sections.append(("Kruskal–Wallis", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"kruskal_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"kruskal_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- POSTHOC: DUNN --------
         elif action == "posthoc_dunn":
-            value = args.get("value"); group = args.get("group"); padj = args.get("p_adjust","holm")
+            value = args.get("value")
+            group = args.get("group")
+            padj = args.get("p_adjust", "holm")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Dunn’s test? Candidates: " + ", ".join(nums)) if not value \
-                      else ("Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                ask = (
+                    "Which numeric outcome for Dunn’s test? Candidates: " + ", ".join(nums)
+                    if not value
+                    else "Which group column (≥2 levels)? Candidates: " + ", ".join(groups)
+                )
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
+            if value not in df.columns:
+                raise gr.Error(f"Column '{value}' not found.")
+            if group not in df.columns:
+                raise gr.Error(f"Group column '{group}' not found.")
+
             txt, imgs = dunn_posthoc(df, value=value, group=group, p_adjust=padj)
             sections.append(("Post-hoc: Dunn’s", txt, None))
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- CHI-SQUARE / FISHER --------
         elif action == "chisq":
-            row = args.get("row"); col = args.get("col"); exact = bool(args.get("exact", False))
+            row = args.get("row")
+            col = args.get("col")
+            exact = bool(args.get("exact", False))
             if not row or not col:
                 cats = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
                 ask = "Which two categorical columns for chi-square? Candidates: " + ", ".join(cats)
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
+            if row not in df.columns:
+                raise gr.Error(f"Column '{row}' not found.")
+            if col not in df.columns:
+                raise gr.Error(f"Column '{col}' not found.")
+
             txt, imgs = chisq_test(df, row=row, col=col, exact=exact)
             sections.append(("Chi-square / Fisher", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"chisq_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"chisq_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- CORRELATION --------
         elif action == "corr":
             if bool(args.get("matrix", False)):
-                method = args.get("method","pearson")
+                method = args.get("method", "pearson")
                 txt, imgs = corr_matrix_plot(df, cols=args.get("cols"), method=method)
                 sections.append(("Correlation matrix", txt, None))
                 for i, im in enumerate(imgs):
-                    pth = save_image_np(im, f"corr_matrix_{method}_{i+1}.png"); image_paths.append(pth)
-                # Keep chat concise for large matrices:
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":"Correlation matrix generated."}])
+                    pth = save_image_np(im, f"corr_matrix_{method}_{i+1}.png")
+                    image_paths.append(pth)
+                chat_history.extend(
+                    [{"role": "user", "content": text}, {"role": "assistant", "content": "Correlation matrix generated."}]
+                )
             else:
-                x = args.get("x"); y = args.get("y"); method = args.get("method","pearson")
+                x = args.get("x")
+                y = args.get("y")
+                method = args.get("method", "pearson")
                 if not x or not y:
                     nums = usable_numeric_cols(df)
                     ask = "Which two numeric columns for correlation? Candidates: " + ", ".join(nums)
-                    chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                    chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                     preview, paths, idx = _safe_last([])
-                    return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                    return (
+                        chat_history,
+                        gr.update(value=preview),
+                        gr.update(value=None, visible=False),
+                        data_preview,
+                        paths,
+                        idx,
+                    )
+                if x not in df.columns or y not in df.columns:
+                    missing = [c for c in [x, y] if c not in df.columns]
+                    raise gr.Error(f"Column(s) not found: {', '.join(missing)}")
                 txt, imgs = corr_pair(df, x=x, y=y, method=method)
                 sections.append(("Correlation", txt, None))
                 for i, im in enumerate(imgs):
-                    pth = save_image_np(im, f"corr_pair_{method}_{i+1}.png"); image_paths.append(pth)
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                    pth = save_image_np(im, f"corr_pair_{method}_{i+1}.png")
+                    image_paths.append(pth)
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- PARTIAL CORRELATION --------
         elif action == "pcorr":
-            x = args.get("x"); y = args.get("y"); ctrls = args.get("controls", []); method = args.get("method","pearson")
+            x = args.get("x")
+            y = args.get("y")
+            ctrls = args.get("controls", [])
+            method = args.get("method", "pearson")
             if not x or not y or not ctrls:
                 nums = usable_numeric_cols(df)
-                ask = "Specify: partial correlation <x> and <y> controlling for <a, b>. Numeric candidates: " + ", ".join(nums)
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                ask = (
+                    "Specify: partial correlation <x> and <y> controlling for <a, b>. Numeric candidates: "
+                    + ", ".join(nums)
+                )
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
+            for c in [x, y] + list(ctrls):
+                if c not in df.columns:
+                    raise gr.Error(f"Column '{c}' not found.")
             txt, imgs = partial_corr(df, x=x, y=y, controls=ctrls, method=method)
             sections.append(("Partial correlation", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"pcorr_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"pcorr_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- POINT-BISERIAL --------
         elif action == "pbiserial":
-            value = args.get("value"); group = args.get("group")
+            value = args.get("value")
+            group = args.get("group")
             if not value or not group:
-                nums, groups = usable_numeric_cols(df), [c for c in df.columns if df[c].nunique(dropna=True)==2]
-                ask = ("Which numeric outcome for point-biserial? Candidates: " + ", ".join(nums)) if not value \
-                      else ("Which binary group? Candidates: " + ", ".join(groups))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                nums, groups = usable_numeric_cols(df), [c for c in df.columns if df[c].nunique(dropna=True) == 2]
+                ask = (
+                    "Which numeric outcome for point-biserial? Candidates: " + ", ".join(nums)
+                    if not value
+                    else "Which binary group? Candidates: " + ", ".join(groups)
+                )
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
+            if value not in df.columns or group not in df.columns:
+                missing = [c for c in [value, group] if c not in df.columns]
+                raise gr.Error(f"Column(s) not found: {', '.join(missing)}")
             txt, imgs = point_biserial(df, value=value, group=group)
             sections.append(("Point-biserial correlation", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"pbiserial_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"pbiserial_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- MANN–WHITNEY --------
         elif action == "mwutest":
-            value = args.get("value"); group = args.get("group")
+            value = args.get("value")
+            group = args.get("group")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Mann–Whitney? Candidates: " + ", ".join(nums)) if not value \
-                      else ("Which group column (2 levels needed)? Candidates: " + ", ".join(groups))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                ask = (
+                    "Which numeric outcome for Mann–Whitney? Candidates: " + ", ".join(nums)
+                    if not value
+                    else "Which group column (2 levels needed)? Candidates: " + ", ".join(groups)
+                )
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
+            if value not in df.columns or group not in df.columns:
+                missing = [c for c in [value, group] if c not in df.columns]
+                raise gr.Error(f"Column(s) not found: {', '.join(missing)}")
             txt, imgs = mann_whitney(df, value=value, group=group)
             sections.append(("Mann–Whitney U", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"mwutest_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"mwutest_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- WILCOXON SIGNED-RANK --------
         elif action == "wilcoxon":
-            a = args.get("a"); b = args.get("b")
+            a = args.get("a")
+            b = args.get("b")
             if not a or not b:
                 nums = usable_numeric_cols(df)
                 ask = "Which two columns are paired? Example: 'wilcoxon pre vs post'. Candidates: " + ", ".join(nums)
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
+            if a not in df.columns or b not in df.columns:
+                missing = [c for c in [a, b] if c not in df.columns]
+                raise gr.Error(f"Column(s) not found: {', '.join(missing)}")
             txt, imgs = wilcoxon_signed(df, a=a, b=b)
             sections.append(("Wilcoxon signed-rank", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"wilcoxon_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"wilcoxon_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- LEVENE --------
         elif action == "levene":
-            value = args.get("value"); group = args.get("group"); center = args.get("center","median")
+            value = args.get("value")
+            group = args.get("group")
+            center = args.get("center", "median")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Levene? Candidates: " + ", ".join(nums)) if not value \
-                      else ("Which group column? Candidates: " + ", ".join(groups))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                ask = (
+                    "Which numeric outcome for Levene? Candidates: " + ", ".join(nums)
+                    if not value
+                    else "Which group column? Candidates: " + ", ".join(groups)
+                )
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
+            if value not in df.columns or group not in df.columns:
+                missing = [c for c in [value, group] if c not in df.columns]
+                raise gr.Error(f"Column(s) not found: {', '.join(missing)}")
             txt, imgs = levene_test(df, value=value, group=group, center=center)
             sections.append(("Levene’s test", txt, None))
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- OLS --------
         elif action == "ols":
             formula = args.get("formula")
             if not formula or "~" not in formula:
-                ask = "Please specify a formula like: `ols score ~ age + weight`."
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                ask = "Please specify a formula like: ols score ~ age + weight."
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
             txt, imgs = run_ols(df, formula=formula)
             sections.append(("OLS", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"ols_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"ols_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- GLM --------
         elif action == "glm":
-            formula = args.get("formula"); family = args.get("family","gaussian")
+            formula = args.get("formula")
+            family = args.get("family", "gaussian")
             if not formula or "~" not in formula:
-                ask = "Please specify a formula like: `glm count ~ age` with `family=poisson`."
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                ask = "Please specify a formula like: glm count ~ age with family=poisson."
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
-                return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                return (
+                    chat_history,
+                    gr.update(value=preview),
+                    gr.update(value=None, visible=False),
+                    data_preview,
+                    paths,
+                    idx,
+                )
             txt, imgs = run_glm(df, formula=formula, family=family)
             sections.append((f"GLM ({family})", txt, None))
             for i, im in enumerate(imgs):
-                pth = save_image_np(im, f"glm_plot_{i+1}.png"); image_paths.append(pth)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(txt)}])
+                pth = save_image_np(im, f"glm_plot_{i+1}.png")
+                image_paths.append(pth)
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(txt)}])
 
         # -------- PLOTS --------
         elif action == "plot":
             if "hist" in args:
-                p = args["hist"]; title, im = plot_hist(df, p.get("col"), int(p.get("bins",30)))
-                pth = save_image_np(im, f"plot_hist_{p.get('col')}.png"); image_paths.append(pth)
+                p = args["hist"]
+                title, im = plot_hist(df, p.get("col"), int(p.get("bins", 30)))
+                pth = save_image_np(im, f"plot_hist_{p.get('col')}.png")
+                image_paths.append(pth)
                 sections.append((title, "", im))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": f"{title} generated."}])
+
             if "box" in args:
-                p = args["box"]; grp = p.get("group")
+                p = args["box"]
+                grp = p.get("group")
                 if grp is None:
                     nums, groups = need_value_and_group(df)
                     ask = "Which group column for the box plot? Candidates: " + ", ".join(groups)
-                    chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                    chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                     preview, paths, idx = _safe_last([])
-                    return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                    return (
+                        chat_history,
+                        gr.update(value=preview),
+                        gr.update(value=None, visible=False),
+                        data_preview,
+                        paths,
+                        idx,
+                    )
                 if p.get("value") == grp:
                     raise gr.Error("Outcome and group must be different.")
+                if p.get("value") not in df.columns or grp not in df.columns:
+                    missing = [c for c in [p.get("value"), grp] if c not in df.columns]
+                    raise gr.Error(f"Column(s) not found: {', '.join(missing)}")
                 title, im = plot_box(df, p.get("value"), grp)
-                pth = save_image_np(im, f"plot_box_{p.get('value')}_{grp}.png"); image_paths.append(pth)
+                pth = save_image_np(im, f"plot_box_{p.get('value')}_{grp}.png")
+                image_paths.append(pth)
                 sections.append((title, "", im))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": f"{title} generated."}])
+
             if "violin" in args:
-                p = args["violin"]; grp = p.get("group")
+                p = args["violin"]
+                grp = p.get("group")
                 if grp is None:
                     nums, groups = need_value_and_group(df)
                     ask = "Which group column for the violin plot? Candidates: " + ", ".join(groups)
-                    chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                    chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                     preview, paths, idx = _safe_last([])
-                    return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                    return (
+                        chat_history,
+                        gr.update(value=preview),
+                        gr.update(value=None, visible=False),
+                        data_preview,
+                        paths,
+                        idx,
+                    )
                 if p.get("value") == grp:
                     raise gr.Error("Outcome and group must be different.")
+                if p.get("value") not in df.columns or grp not in df.columns:
+                    missing = [c for c in [p.get("value"), grp] if c not in df.columns]
+                    raise gr.Error(f"Column(s) not found: {', '.join(missing)}")
                 title, im = plot_violin(df, p.get("value"), grp)
-                pth = save_image_np(im, f"plot_violin_{p.get('value')}_{grp}.png"); image_paths.append(pth)
+                pth = save_image_np(im, f"plot_violin_{p.get('value')}_{grp}.png")
+                image_paths.append(pth)
                 sections.append((title, "", im))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"{title} generated."}])
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": f"{title} generated."}])
+
             if "bar" in args:
-                p = args["bar"]; grp = p.get("group")
+                p = args["bar"]
+                grp = p.get("group")
                 if grp is None:
                     nums, groups = need_value_and_group(df)
                     ask = "Which group column for the bar chart? Candidates: " + ", ".join(groups)
-                    chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":ask}])
+                    chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                     preview, paths, idx = _safe_last([])
-                    return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+                    return (
+                        chat_history,
+                        gr.update(value=preview),
+                        gr.update(value=None, visible=False),
+                        data_preview,
+                        paths,
+                        idx,
+                    )
                 if p.get("value") == grp:
                     raise gr.Error("Outcome and group must be different.")
-                err = p.get("error","sem")
+                if p.get("value") not in df.columns or grp not in df.columns:
+                    missing = [c for c in [p.get("value"), grp] if c not in df.columns]
+                    raise gr.Error(f"Column(s) not found: {', '.join(missing)}")
+                err = p.get("error", "sem")
                 gorder = ordered_groups(df, grp)
                 im = bar_with_error_plot(df, p.get("value"), grp, error=err, gorder=gorder)
-                pth = save_image_np(im, f"plot_bar_{p.get('value')}_{grp}_{err}.png"); image_paths.append(pth)
+                pth = save_image_np(im, f"plot_bar_{p.get('value')}_{grp}_{err}.png")
+                image_paths.append(pth)
                 sections.append((f"Bar {p.get('value')}~{grp}", "", im))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":f"Bar ± {str(err).upper()} generated."}])
+                chat_history.extend(
+                    [{"role": "user", "content": text}, {"role": "assistant", "content": f"Bar ± {str(err).upper()} generated."}]
+                )
 
         # -------- CHECKS --------
         elif action == "check":
             if "normality" in args:
-                p = args["normality"]; msg, im = check_normality(df, p.get("col"))
-                pth = save_image_np(im, f"plot_qq_{p.get('col')}.png"); image_paths.append(pth)
+                p = args["normality"]
+                msg, im = check_normality(df, p.get("col"))
+                pth = save_image_np(im, f"plot_qq_{p.get('col')}.png")
+                image_paths.append(pth)
                 sections.append(("Normality", msg, im))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(msg)}])
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
 
         # -------- POWER --------
         elif action == "power":
             if "ttest_ind" in args:
                 p = args["ttest_ind"]
-                msg = power_ttest_ind(p.get("effect_size",0.5), float(p.get("alpha",0.05)), p.get("power",0.8), float(p.get("ratio",1.0)), p.get("solve_for","n_total"))
+                msg = power_ttest_ind(
+                    p.get("effect_size", 0.5),
+                    float(p.get("alpha", 0.05)),
+                    p.get("power", 0.8),
+                    float(p.get("ratio", 1.0)),
+                    p.get("solve_for", "n_total"),
+                )
                 sections.append(("Power – t-test (ind)", msg, None))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(msg)}])
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
             if "anova_oneway" in args:
                 p = args["anova_oneway"]
-                msg = power_anova_oneway(p.get("effect_size",0.25), int(p.get("k_groups",3)), float(p.get("alpha",0.05)), p.get("power",0.8), p.get("solve_for","n_per_group"))
+                msg = power_anova_oneway(
+                    p.get("effect_size", 0.25),
+                    int(p.get("k_groups", 3)),
+                    float(p.get("alpha", 0.05)),
+                    p.get("power", 0.8),
+                    p.get("solve_for", "n_per_group"),
+                )
                 sections.append(("Power – ANOVA (one-way)", msg, None))
-                chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":_fence(msg)}])
-
+                chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
         else:
             msg = clarify_message(df, llm_error_text, text)
-            chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+            chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
 
     except gr.Error as e:
         msg = f"Sorry — {e}"
-        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+        chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
         preview, paths, idx = _safe_last([])
-        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+        return (
+            chat_history,
+            gr.update(value=preview),
+            gr.update(value=None, visible=False),
+            data_preview,
+            paths,
+            idx,
+        )
     except Exception as e:
         msg = f"Sorry — something went wrong: {e}"
-        chat_history.extend([{"role":"user","content":text},{"role":"assistant","content":msg}])
+        chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": msg}])
         preview, paths, idx = _safe_last([])
-        return chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx
+        return (
+            chat_history,
+            gr.update(value=preview),
+            gr.update(value=None, visible=False),
+            data_preview,
+            paths,
+            idx,
+        )
 
     report_fp = write_report(sections)
     zip_fp = save_zip()
     preview, paths, idx = _safe_last(image_paths)
-    return chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx
+    return (
+        chat_history,
+        gr.update(value=preview),
+        gr.update(value=zip_fp, visible=True),
+        data_preview,
+        paths,
+        idx,
+    )
 
-# ---------- UI ----------
+
+# ---------- OPTIONAL: SIGNIFICANCE ANNOTATION OVER BARS ----------
+def _p_to_stars(p: float) -> str:
+    return "ns" if p >= 0.05 else ("*" if p >= 0.01 else ("**" if p >= 0.001 else "***"))
+
+
+def annotate_ttest_on_bar(df: pd.DataFrame, value: str, group: str, g1: str, g2: str, p: float) -> np.ndarray:
+    """
+    Overlays a simple p-value + stars on top of a bar±SEM image.
+    Returns a NumPy image array.
+    """
+    underlay = bar_with_error_plot(df, value, group, error="sem", gorder=[g1, g2])
+    stars = _p_to_stars(p)
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.imshow(underlay)
+    ax.axis("off")
+    ax.text(
+        0.5,
+        0.06,
+        f"p = {p:.3g} ({stars})",
+        transform=ax.transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=12,
+        bbox=dict(boxstyle="round", fc="white", ec="none", alpha=0.75),
+    )
+    fig.tight_layout()
+    return _render(fig)
+
+
+# --------------------------
+# UI
+# --------------------------
 with gr.Blocks(title="SpatChat: Stats Room") as demo:
     gr.Image(
         value="logo_long1.png",
@@ -1649,35 +2330,45 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
         show_download_button=False,
         show_share_button=False,
         type="filepath",
-        elem_id="logo-img"
+        elem_id="logo-img",
     )
-    gr.HTML("""
-    <style>
-    #logo-img img { height: 90px; margin: 10px 50px 10px 10px; border-radius: 6px; }
-    .dataframe-wrap { max-height: 340px; overflow: auto; border: 1px solid #ddd; border-radius: 6px; padding: 6px; }
-    #preview-plot { margin-bottom: 6px; }
-    #plot-nav { margin: 0 0 10px 0; display: flex; gap: 8px; justify-content: flex-end; }
-    </style>
-    """)
+    gr.HTML(
+        """
+<style>
+#logo-img img { height: 90px; margin: 10px 50px 10px 10px; border-radius: 6px; }
+.dataframe-wrap { max-height: 340px; overflow: auto; border: 1px solid #ddd; border-radius: 6px; padding: 6px; }
+#preview-plot { margin-bottom: 6px; }
+#plot-nav { margin: 0 0 10px 0; display: flex; gap: 8px; justify-content: flex-end; }
+</style>
+"""
+    )
     gr.Markdown("## 📊 SpatChat: Stats Room {stats}")
-    gr.HTML("""
-    <div style="margin-top: -10px; margin-bottom: 15px;">
-      <input type="text" value="https://spatchat.org/browse/?room=stats" id="shareLink" readonly style="width: 50%; padding: 5px; background-color: #f8f8f8; color: #222; font-weight: 500; border: 1px solid #ccc; border-radius: 4px;">
-      <button onclick="navigator.clipboard.writeText(document.getElementById('shareLink').value)" style="padding: 5px 10px; background-color: #007BFF; color: white; border: none; border-radius: 4px; cursor: pointer;">📋 Copy Share Link</button>
-      <div style="margin-top: 10px; font-size: 14px;">
-        <b>Share:</b>
-        <a href="https://twitter.com/intent/tweet?text=Checkout+Spatchat!&url=https://spatchat.org/browse/?room=stats" target="_blank">🐦 Twitter</a> |
-        <a href="https://www.facebook.com/sharer/sharer.php?u=https://spatchat.org/browse/?room=stats" target="_blank">📘 Facebook</a>
-      </div>
-    </div>
-    """)
-    gr.Markdown("""
-        <div style="font-size: 14px;">
-        © 2025 Ho Yi Wan & Logan Hysen. All rights reserved.<br>
-        If you use SpatChat in research, please cite:<br>
-        <b>Wan, H.Y.</b> & <b>Hysen, L.</b> (2025). <i>SpatChat: Stats Room.</i>
-        </div>
-    """)
+    gr.HTML(
+        """
+<div style="margin-top: -10px; margin-bottom: 15px;">
+  <input type="text" value="https://spatchat.org/browse/?room=stats" id="shareLink" readonly
+         style="width: 50%; padding: 5px; background-color: #f8f8f8; color: #222; font-weight: 500; border: 1px solid #ccc; border-radius: 4px;">
+  <button onclick="navigator.clipboard.writeText(document.getElementById('shareLink').value)"
+          style="padding: 5px 10px; background-color: #007BFF; color: white; border: none; border-radius: 4px; cursor: pointer;">
+    📋 Copy Share Link
+  </button>
+  <div style="margin-top: 10px; font-size: 14px;">
+    <b>Share:</b>
+    <a href="https://twitter.com/intent/tweet?text=Checkout+Spatchat!&url=https://spatchat.org/browse/?room=stats" target="_blank">🐦 Twitter</a> |
+    <a href="https://www.facebook.com/sharer/sharer.php?u=https://spatchat.org/browse/?room=stats" target="_blank">📘 Facebook</a>
+  </div>
+</div>
+"""
+    )
+    gr.Markdown(
+        """
+<div style="font-size: 14px;">
+© 2025 Ho Yi Wan & Logan Hysen. All rights reserved.<br>
+If you use SpatChat in research, please cite:<br>
+<b>Wan, H.Y.</b> & <b>Hysen, L.</b> (2025). <i>SpatChat: Stats Room.</i>
+</div>
+"""
+    )
 
     with gr.Row():
         with gr.Column(scale=2):
@@ -1685,37 +2376,38 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
                 label="SpatChat",
                 show_label=True,
                 type="messages",
-                # keep Markdown enabled so bullets render nicely; code-fencing handles stats blocks
-                value=[{"role":"assistant","content":"Welcome! Upload a CSV, then ask: t-test, ANOVA (+Tukey), Kruskal (+Dunn), correlations (Pearson/Spearman), partial/pbiserial, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Levene’s, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'."}]
+                value=[
+                    {
+                        "role": "assistant",
+                        "content": "Welcome! Upload a CSV, then ask: t-test, ANOVA (+Tukey), Kruskal (+Dunn), correlations (Pearson/Spearman), partial/pbiserial, chi-square/Fisher, rank tests (Mann-Whitney, Wilcoxon), Levene’s, OLS/GLM, histogram, box/violin/bar, normality, power, quick summaries, or 'what can I do with my data?'.",
+                    }
+                ],
             )
             user_input = gr.Textbox(label="Ask SpatChat", placeholder="e.g., Tukey HSD score by group", lines=1)
             file_input = gr.File(label="Upload CSV", file_types=[".csv"])
-        with gr.Column(scale=3):
-            preview_plot = gr.Image(
-                label="Preview (last figure)",
-                value=None,
-                type="filepath",
-                elem_id="preview-plot"
-            )
 
+        with gr.Column(scale=3):
+            preview_plot = gr.Image(label="Preview (last figure)", value=None, type="filepath", elem_id="preview-plot")
             with gr.Row(elem_id="plot-nav"):
                 prev_btn = gr.Button("◀️ Prev", variant="secondary")
                 next_btn = gr.Button("Next ▶️", variant="secondary")
-
             data_preview = gr.Dataframe(label="Data Preview (first 200 rows)", interactive=False, visible=False)
             download_btn = gr.DownloadButton("📥 Download Results", value=None, visible=False)
-
             gallery_paths = gr.State([])
             gallery_index = gr.State(-1)
 
     demo.queue(max_size=16)
 
-    file_input.change(handle_upload, inputs=file_input, outputs=[chatbot, data_preview, download_btn])
+    file_input.change(
+        handle_upload,
+        inputs=file_input,
+        outputs=[chatbot, data_preview, download_btn],
+    )
 
     user_input.submit(
         handle_chat,
         inputs=[chatbot, user_input, data_preview],
-        outputs=[chatbot, preview_plot, download_btn, data_preview, gallery_paths, gallery_index]
+        outputs=[chatbot, preview_plot, download_btn, data_preview, gallery_paths, gallery_index],
     )
     user_input.submit(lambda *args: "", inputs=None, outputs=user_input)
 
@@ -1729,6 +2421,7 @@ with gr.Blocks(title="SpatChat: Stats Room") as demo:
 
     prev_btn.click(on_prev, inputs=[gallery_paths, gallery_index], outputs=[preview_plot, gallery_index])
     next_btn.click(on_next, inputs=[gallery_paths, gallery_index], outputs=[preview_plot, gallery_index])
+
 
 if __name__ == "__main__":
     demo.launch(ssr_mode=False)
