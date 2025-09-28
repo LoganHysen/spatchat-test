@@ -95,79 +95,70 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
     Summarize numeric columns with mean/sd/median/min/max.
     Summarize non-numeric columns with unique count + top values.
 
-    - If `col` is one of {"*", "data", "dataset", "everything"}: summarize ALL columns.
-    - If a single `col` is provided: summarize only that column.
-    - Optional grouping via `by` (case-insensitive column resolution).
+    If `col` ∈ {'*','data','dataset','everything'} → summarize ALL columns.
+    Optional `by` groups the summary and prints both numeric and categorical blocks in each group.
     """
     special_all = {"*", "data", "dataset", "everything"}
 
-    # Resolve grouping column (case-insensitive)
-    by_resolved: Optional[str] = None
+    # Resolve grouping column
+    by_resolved = None
     if by is not None:
         by_resolved = _resolve_col_case_insensitive(df, by)
         if by_resolved is None:
+            print(f"[DEBUG] Group column '{by}' not found among {list(df.columns)}")
             return f"Group column '{by}' not found."
         if df[by_resolved].nunique(dropna=True) < 2:
+            print(f"[DEBUG] Group column '{by_resolved}' has <2 levels")
             return f"Group column '{by_resolved}' has <2 levels."
 
-    # Determine which columns we will summarize
+    # Columns to summarize
     if str(col).strip().lower() in special_all:
-        cols = list(df.columns)
+        cols = [c for c in df.columns if c != by_resolved]
     else:
         c = _resolve_col_case_insensitive(df, col)
         if c is None:
+            print(f"[DEBUG] Column '{col}' not found among {list(df.columns)}")
             return f"Column '{col}' not found."
         cols = [c]
 
-    # Partition columns into numeric-ish vs categorical (excluding the group column from both lists only in selection,
-    # but we will still summarize the group column as categorical within each group if the user explicitly asked for just that column)
-    cols_all = cols[:] if str(col).strip().lower() not in special_all else [c for c in cols if c != by_resolved]
+    numeric_cols = [c for c in cols if _is_numericish(df[c])]
+    categorical_cols = [c for c in cols if c not in numeric_cols]
 
-    numeric_cols = [c for c in cols_all if _is_numericish(df[c])]
-    categorical_cols = [c for c in cols_all if c not in numeric_cols]
+    # Debug output
+    print(f"[DEBUG] quick_summary called with col={col}, by={by}")
+    print(f"[DEBUG] Columns to summarize: {cols}")
+    print(f"[DEBUG] Numeric columns detected: {numeric_cols}")
+    print(f"[DEBUG] Categorical columns detected: {categorical_cols}")
 
     lines: List[str] = []
 
-    # Build summaries
     if by_resolved is None:
-        # No grouping — print numeric then categorical sections (omit empty sections)
-        title = (
-            f"Dataset summary ({cols[0]})" if len(cols) == 1 and str(col).strip().lower() not in special_all
-            else "Dataset summary (no grouping)"
-        )
-        lines.append(title)
-
+        lines.append("Dataset summary (no grouping):")
         if numeric_cols:
             lines.append("- Numeric:")
             for c in numeric_cols:
                 lines.append(f"  • {c}: {_summ_numeric(df[c])}")
-
         if categorical_cols:
             lines.append("- Categorical:")
             for c in categorical_cols:
                 lines.append(f"  • {c}: {_summ_categorical(df[c])}")
-
     else:
-        # Grouped summary — iterate all groups and list numeric and categorical blocks for each
         lines.append(f"Dataset summary by {by_resolved}:")
-        group_order = _group_order(df, by_resolved)
-
-        for g in group_order:
+        group_levels = _group_order(df, by_resolved)
+        print(f"[DEBUG] Group levels detected: {group_levels}")
+        for g in group_levels:
             subset = df[df[by_resolved].astype(str) == g]
-
-            # Numeric block
             if numeric_cols:
                 lines.append(f"- {by_resolved} = {g} (numeric):")
                 for c in numeric_cols:
                     lines.append(f"  • {c}: {_summ_numeric(subset[c])}")
-
-            # Categorical block
             if categorical_cols:
                 lines.append(f"- {by_resolved} = {g} (categorical):")
                 for c in categorical_cols:
                     lines.append(f"  • {c}: {_summ_categorical(subset[c])}")
 
     return "\n".join(lines)
+
 
 # ----------------------------
 # Plotting helpers
