@@ -1,10 +1,11 @@
-# app.py (core logic only — NO UI)
+# app.py (full — core logic + existing UI layout preserved)
 # Wires together LLM, parsing, stats submodules, and handlers used by the UI layer.
 
 # =========================
 # Imports
 # =========================
 import os
+import json
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
@@ -116,6 +117,32 @@ def _step(paths: List[str], idx: int, delta: int) -> Tuple[Optional[str], int]:
     n = len(paths)
     new_idx = (idx + delta) % n
     return paths[new_idx], new_idx
+
+
+# --- Case-insensitive column resolution (supports *, data, dataset, everything) ---
+SPECIAL_ALL = {"*", "data", "dataset", "everything"}
+
+def resolve_col(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    s = str(name).strip()
+    if s.lower() in SPECIAL_ALL:
+        return s  # understood by quick_summary
+    cols = list(df.columns)
+    if s in cols:
+        return s
+    lower_map = {c.lower(): c for c in cols}
+    return lower_map.get(s.lower())
+
+def resolve_group(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    s = str(name).strip()
+    cols = list(df.columns)
+    if s in cols:
+        return s
+    lower_map = {c.lower(): c for c in cols}
+    return lower_map.get(s.lower())
 
 
 # =========================
@@ -245,15 +272,25 @@ def handle_chat(chat_history, user_message, data_preview):
             preview, paths, idx = _safe_last([])
             return (chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx)
 
-        # -------- Summary --------
+        # -------- Summary (robust to case mismatches and stringy groups) --------
         if action == "summary":
-            col = args.get("col")
-            by = args.get("by")
-            special_all = {"*", "data", "dataset", "everything"}
-        
-            if col not in df.columns and str(col).strip().lower() not in special_all:
-                raise gr.Error(f"Column '{col}' not found.")
-        
+            req_col = args.get("col")
+            req_by  = args.get("by")
+
+            # Resolve names safely (case-insensitive + supports *,data,… for col)
+            col = resolve_col(df, req_col)
+            by  = resolve_group(df, req_by) if req_by is not None else None
+
+            if col is None:
+                raise gr.Error(
+                    f"Column '{req_col}' not found. Available: " + ", ".join(map(str, df.columns))
+                )
+            if by is not None and by not in df.columns:
+                raise gr.Error(
+                    f"Group column '{req_by}' not found. Available: " + ", ".join(map(str, df.columns))
+                )
+
+            # All numeric coercions happen inside quick_summary (errors='coerce'); no float-casting here.
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
@@ -625,8 +662,21 @@ def handle_chat(chat_history, user_message, data_preview):
     preview, paths, idx = _safe_last(image_paths)
     return (chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx)
 
+
+# =========================
+# Optional: gallery nav helpers the UI may bind to buttons
+# =========================
+def on_prev(paths, idx):
+    preview, new_idx = _step(paths, idx, -1)
+    return gr.update(value=preview), new_idx
+
+
+def on_next(paths, idx):
+    preview, new_idx = _step(paths, idx, +1)
+    return gr.update(value=preview), new_idx
+
 # --------------------------
-# UI
+# UI (layout preserved)
 # --------------------------
 with gr.Blocks(title="SpatChat: Stats Room") as demo:
     gr.Image(
@@ -730,3 +780,4 @@ If you use SpatChat in research, please cite:<br>
 
 if __name__ == "__main__":
     demo.launch(ssr_mode=False)
+
