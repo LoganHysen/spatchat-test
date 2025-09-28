@@ -1,5 +1,4 @@
 # stats/__init__.py
-# Re-exports to keep existing imports/handlers working after modularization.
 
 # Location / two-group / paired tests
 from .tests_location import (
@@ -32,17 +31,36 @@ from .associations import chisq_test
 # Modeling
 from .modeling import run_ols, run_glm
 
-# Descriptives & distribution checks
+# Descriptives & distribution checks (NO quick_summary export here)
 from .descriptives import (
     plot_hist,
     plot_box,
     plot_violin,
     check_normality,
-    quick_summary,   # <-- move quick_summary here
 )
 
 # Power
 from .power import power_ttest_ind, power_anova_oneway
 
-# Recommendations (only)
-from .recommendations import recommend_text_and_examples
+# >>> Recommendations & dataset summary (canonical)
+# Make SURE quick_summary comes ONLY from recommendations
+from .recommendations import quick_summary, recommend_text_and_examples
+
+__all__ = [
+    # tests_location
+    "ttest_summary", "run_ttest", "mann_whitney", "wilcoxon_signed", "point_biserial",
+    # tests_variance
+    "run_anova", "kruskal_wallis", "levene_test", "tukey_hsd", "dunn_posthoc",
+    # correlations
+    "corr_pair", "corr_matrix_plot", "partial_corr",
+    # associations
+    "chisq_test",
+    # modeling
+    "run_ols", "run_glm",
+    # descriptives (plots/checks only)
+    "plot_hist", "plot_box", "plot_violin", "check_normality",
+    # power
+    "power_ttest_ind", "power_anova_oneway",
+    # recommendations & summary
+    "quick_summary", "recommend_text_and_examples",
+]
