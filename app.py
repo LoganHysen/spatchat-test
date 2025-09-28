@@ -1,11 +1,9 @@
-# app.py (full — core logic + existing UI layout preserved)
-# Wires together LLM, parsing, stats submodules, and handlers used by the UI layer.
+# app.py
 
 # =========================
 # Imports
 # =========================
 import os
-import json
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
@@ -119,32 +117,6 @@ def _step(paths: List[str], idx: int, delta: int) -> Tuple[Optional[str], int]:
     return paths[new_idx], new_idx
 
 
-# --- Case-insensitive column resolution (supports *, data, dataset, everything) ---
-SPECIAL_ALL = {"*", "data", "dataset", "everything"}
-
-def resolve_col(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
-    if name is None:
-        return None
-    s = str(name).strip()
-    if s.lower() in SPECIAL_ALL:
-        return s  # understood by quick_summary
-    cols = list(df.columns)
-    if s in cols:
-        return s
-    lower_map = {c.lower(): c for c in cols}
-    return lower_map.get(s.lower())
-
-def resolve_group(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
-    if name is None:
-        return None
-    s = str(name).strip()
-    cols = list(df.columns)
-    if s in cols:
-        return s
-    lower_map = {c.lower(): c for c in cols}
-    return lower_map.get(s.lower())
-
-
 # =========================
 # Data & chat handlers (used by UI)
 # =========================
@@ -211,14 +183,23 @@ def handle_chat(chat_history, user_message, data_preview):
     chat_history = list(chat_history)
     text = str(user_message or "").strip()
 
+    # ----------------------------
+    # Prefer deterministic parser FIRST, then LLM as fallback
+    # ----------------------------
     parsed = None
     llm_error_text = None
-    try:
-        tool, _ = ask_llm(chat_history, text)
-        parsed = tool
-    except Exception as e:
-        llm_error_text = f"(LLM unavailable: {e})"
 
+    lp = local_parse(text)
+    if lp:
+        parsed = lp
+    else:
+        try:
+            tool, _ = ask_llm(chat_history, text)
+            parsed = tool
+        except Exception as e:
+            llm_error_text = f"(LLM unavailable: {e})"
+
+    # If nothing, try local_parse once more defensively
     if not parsed:
         lp = local_parse(text)
         if lp:
@@ -253,9 +234,24 @@ def handle_chat(chat_history, user_message, data_preview):
             idx,
         )
 
+    # Now that we have data, we can safely normalize summary intents
+    df = cached_df.copy()
     action = parsed.get("action")
     args = sanitize_args(action, parsed.get("args", {}))
-    df = cached_df.copy()
+
+    # Heuristic normalization for "summarize data ..." to force full-dataset summary
+    if action == "summary":
+        user_lower = f" {text.lower()} "
+        special_all = {"*", "data", "dataset", "everything", "all"}
+        # If the user phrasing clearly implies whole dataset, force it
+        if any(tok in user_lower for tok in [" summarize data", "summary data", "summarize the data", " dataset", " everything", " summarize all", " summary all"]):
+            args["col"] = "data"
+        # If no column supplied, default to whole dataset
+        if not args.get("col"):
+            args["col"] = "data"
+        # If a column name is present but not an actual column and there's a ' by ' phrase, prefer whole dataset by group
+        if args.get("col") and (args["col"] not in df.columns) and (" by " in user_lower) and (args["col"].lower() not in special_all):
+            args["col"] = "data"
 
     sections: List[Tuple[str, str, Optional[np.ndarray]]] = []
     image_paths: List[str] = []
@@ -272,25 +268,11 @@ def handle_chat(chat_history, user_message, data_preview):
             preview, paths, idx = _safe_last([])
             return (chat_history, gr.update(value=preview), gr.update(value=zip_fp, visible=True), data_preview, paths, idx)
 
-        # -------- Summary (robust to case mismatches and stringy groups) --------
+        # -------- Summary --------
         if action == "summary":
-            req_col = args.get("col")
-            req_by  = args.get("by")
-
-            # Resolve names safely (case-insensitive + supports *,data,… for col)
-            col = resolve_col(df, req_col)
-            by  = resolve_group(df, req_by) if req_by is not None else None
-
-            if col is None:
-                raise gr.Error(
-                    f"Column '{req_col}' not found. Available: " + ", ".join(map(str, df.columns))
-                )
-            if by is not None and by not in df.columns:
-                raise gr.Error(
-                    f"Group column '{req_by}' not found. Available: " + ", ".join(map(str, df.columns))
-                )
-
-            # All numeric coercions happen inside quick_summary (errors='coerce'); no float-casting here.
+            col = args.get("col")
+            by = args.get("by")
+            # Let quick_summary handle validation and produce friendly messages
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
@@ -676,7 +658,7 @@ def on_next(paths, idx):
     return gr.update(value=preview), new_idx
 
 # --------------------------
-# UI (layout preserved)
+# UI  (layout unchanged)
 # --------------------------
 with gr.Blocks(title="SpatChat: Stats Room") as demo:
     gr.Image(
@@ -780,4 +762,3 @@ If you use SpatChat in research, please cite:<br>
 
 if __name__ == "__main__":
     demo.launch(ssr_mode=False)
-
