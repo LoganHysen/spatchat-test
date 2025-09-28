@@ -9,7 +9,7 @@ import statsmodels.api as sm
 
 from core_utils import usable_numeric_cols, is_integer_like
 from plot_helpers import (
-    fig_to_np,           # image rendering helper
+    fig_to_np,
     box_plot as _box_plot_primitive,
     violin_plot as _violin_plot_primitive,
 )
@@ -22,18 +22,26 @@ __all__ = [
     "check_normality",
 ]
 
-# ---------- internal utils ----------
-def _summ_one(series: pd.Series) -> str:
+# ----------------------------
+# Internal helpers
+# ----------------------------
+def _summ_numeric(series: pd.Series) -> str:
     s = pd.to_numeric(series, errors="coerce").dropna().astype(float)
     if len(s) == 0:
         return "n=0"
     return f"n={len(s)}, mean={s.mean():.4g}, sd={s.std(ddof=1):.4g}, min={s.min():.4g}, max={s.max():.4g}"
 
+def _summ_categorical(series: pd.Series, top_n: int = 5) -> str:
+    vc = series.dropna().astype(str).value_counts()
+    if vc.empty:
+        return "n=0"
+    head = vc.head(top_n)
+    return f"n={len(series)}, unique={series.nunique(dropna=True)}, top={', '.join([f'{k} ({v})' for k, v in head.items()])}"
+
 def _group_order(df: pd.DataFrame, by: str) -> List[str]:
     sby = df[by]
     if pd.api.types.is_categorical_dtype(sby):
         return [str(x) for x in sby.cat.categories]
-    # Stable lexicographic order of first-seen unique labels; no numeric casting
     seen: List[str] = []
     for v in sby.dropna():
         sv = str(v)
@@ -41,81 +49,67 @@ def _group_order(df: pd.DataFrame, by: str) -> List[str]:
             seen.append(sv)
     return sorted(seen, key=lambda x: (x.lower(), x))
 
-# ---------- summaries ----------
+# ----------------------------
+# Main public API
+# ----------------------------
 def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
     """
-    Flexible summary:
-      - If col in {'*','data','dataset','everything'}: summarize ALL numeric columns
-        (optionally grouped by 'by').
-      - If specific column:
-          * numeric-like -> numeric summary (optionally by group)
-          * non-numeric   -> top categories (optionally by group)
-    Graceful coercion; no exceptions on type conversion.
+    Summarize numeric columns with mean/sd/min/max.
+    Summarize non-numeric columns with unique count + top values.
+    If `col` is '*', 'data', 'dataset', 'everything': summarize ALL columns.
+    If a single `col` is provided: summarize only that column.
+    Supports optional grouping via `by`.
     """
     special_all = {"*", "data", "dataset", "everything"}
+    lines: List[str] = []
 
-    # Validate grouping, if provided
+    # ----------------------------
+    # Determine columns to summarize
+    # ----------------------------
+    if str(col).strip().lower() in special_all:
+        cols = list(df.columns)
+    else:
+        if col not in df.columns:
+            return f"Column '{col}' not found."
+        cols = [col]
+
+    # Grouping order
+    group_order: List[str] = []
     if by is not None:
         if by not in df.columns:
             return f"Group column '{by}' not found."
         if df[by].nunique(dropna=True) < 2:
             return f"Group column '{by}' has <2 levels."
+        group_order = _group_order(df, by)
 
-    # ----- ALL NUMERIC COLUMNS -----
-    if str(col).strip().lower() in special_all:
-        nums = usable_numeric_cols(df)
-        if not nums:
-            return "No numeric columns found to summarize."
-        lines: List[str] = []
-        if by is None:
-            lines.append("Summary of all numeric columns (no grouping):")
-            for c in nums:
-                lines.append(f"- {c}: {_summ_one(df[c])}")
-        else:
-            lines.append(f"Summary of all numeric columns by {by}:")
-            order = _group_order(df, by)
-            for g in order:
-                lines.append(f"- {by} = {g}:")
-                block = df[df[by].astype(str) == g]
-                for c in nums:
-                    lines.append(f"  • {c}: {_summ_one(block[c])}")
-        return "\n".join(lines)
-
-    # ----- SINGLE COLUMN -----
-    if col not in df.columns:
-        return f"Column '{col}' not found."
-
-    series = df[col]
-    is_numlike = pd.api.types.is_numeric_dtype(series) or is_integer_like(series)
-
+    # ----------------------------
+    # Build summary
+    # ----------------------------
     if by is None:
-        if is_numlike:
-            return f"Summary of {col}: {_summ_one(series)}"
-        vc = series.dropna().astype(str).value_counts().head(10)
-        if vc.empty:
-            return f"Summary of {col}: n=0"
-        return f"Top categories of {col} (overall):\n" + "\n".join([f"- {k}: {int(v)}" for k, v in vc.items()])
+        lines.append("Dataset summary (no grouping):")
+        for c in cols:
+            series = df[c]
+            if pd.api.types.is_numeric_dtype(series) or is_integer_like(series):
+                lines.append(f"- {c}: {_summ_numeric(series)}")
+            else:
+                lines.append(f"- {c}: {_summ_categorical(series)}")
+    else:
+        lines.append(f"Dataset summary by {by}:")
+        for g in group_order:
+            subset = df[df[by].astype(str) == g]
+            lines.append(f"- {by} = {g}:")
+            for c in cols:
+                series = subset[c]
+                if pd.api.types.is_numeric_dtype(series) or is_integer_like(series):
+                    lines.append(f"  • {c}: {_summ_numeric(series)}")
+                else:
+                    lines.append(f"  • {c}: {_summ_categorical(series)}")
 
-    # With grouping
-    order = _group_order(df, by)
-
-    if is_numlike:
-        lines = [f"Summary of {col} by {by}:"]
-        for g in order:
-            s = df[df[by].astype(str) == g][col]
-            lines.append(f"- {g}: {_summ_one(s)}")
-        return "\n".join(lines)
-
-    lines = [f"Top categories of {col} by {by}:"]
-    for g in order:
-        vc = df[df[by].astype(str) == g][col].dropna().astype(str).value_counts().head(10)
-        if vc.empty:
-            lines.append(f"- {g}: n=0")
-        else:
-            lines.append(f"- {g}: " + ", ".join([f"{k} ({int(v)})" for k, v in vc.items()]))
     return "\n".join(lines)
 
-# ---------- plotting helpers expected by stats.__init__ ----------
+# ----------------------------
+# Plotting helpers
+# ----------------------------
 def plot_hist(df: pd.DataFrame, col: str, bins: int = 30) -> Tuple[str, np.ndarray]:
     s = pd.to_numeric(df[col], errors="coerce").dropna().astype(float)
     fig, ax = plt.subplots(figsize=(6, 3))
