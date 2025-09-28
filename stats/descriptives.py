@@ -1,8 +1,24 @@
 # stats/descriptives.py
 from typing import Optional, List
-import numpy as np
 import pandas as pd
-from core_utils import usable_numeric_cols, is_integer_like  # already in your repo
+
+from core_utils import usable_numeric_cols, is_integer_like
+
+# Re-export plot/check helpers so stats.__init__ can import from .descriptives
+from plot_helpers import (
+    plot_hist as plot_hist,
+    plot_box as plot_box,
+    plot_violin as plot_violin,
+    check_normality as check_normality,
+)
+
+__all__ = [
+    "quick_summary",
+    "plot_hist",
+    "plot_box",
+    "plot_violin",
+    "check_normality",
+]
 
 def _summ_one(series: pd.Series) -> str:
     s = pd.to_numeric(series, errors="coerce").dropna().astype(float)
@@ -17,12 +33,12 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
         (optionally by a grouping column).
       - If a specific column is given:
           * numeric -> numeric summary (optionally by group)
-          * non-numeric -> show top categories (optionally by group)
+          * non-numeric -> top categories (optionally by group)
     Never raises on type conversion; falls back gracefully.
     """
-    special_all = { "*", "data", "dataset", "everything" }
+    special_all = {"*", "data", "dataset", "everything"}
 
-    # Grouping column sanity
+    # Validate grouping column if provided
     if by is not None:
         if by not in df.columns:
             return f"Group column '{by}' not found."
@@ -36,12 +52,12 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
             return "No numeric columns found to summarize."
         lines: List[str] = []
         if by is None:
-            lines.append(f"Summary of all numeric columns (no grouping):")
+            lines.append("Summary of all numeric columns (no grouping):")
             for c in nums:
                 lines.append(f"- {c}: {_summ_one(df[c])}")
         else:
             lines.append(f"Summary of all numeric columns by {by}:")
-            order = []
+            # determine group order
             sby = df[by]
             if pd.api.types.is_categorical_dtype(sby):
                 order = [str(x) for x in sby.cat.categories]
@@ -64,19 +80,18 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
 
     series = df[col]
     # Numeric-like?
-    is_numeric = pd.api.types.is_numeric_dtype(series) or is_integer_like(series)
+    is_numlike = pd.api.types.is_numeric_dtype(series) or is_integer_like(series)
 
     if by is None:
-        if is_numeric:
+        if is_numlike:
             return f"Summary of {col}: {_summ_one(series)}"
         # non-numeric overall: show top categories
         vc = series.dropna().astype(str).value_counts().head(10)
         if vc.empty:
             return f"Summary of {col}: n=0"
-        return f"Top categories of {col} (overall):\n" + "\n".join([f"- {k}: {int(v)}" for k, v in vc.items()])
+        return "Top categories of {col} (overall):\n" + "\n".join([f"- {k}: {int(v)}" for k, v in vc.items()]).format(col=col)
 
     # With grouping
-    order = []
     sby = df[by]
     if pd.api.types.is_categorical_dtype(sby):
         order = [str(x) for x in sby.cat.categories]
@@ -87,7 +102,7 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
         except Exception:
             order = sorted(order, key=lambda x: (x.lower(), x))
 
-    if is_numeric:
+    if is_numlike:
         lines = [f"Summary of {col} by {by}:"]
         for g in order:
             s = df[df[by].astype(str) == g][col]
@@ -97,12 +112,9 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
     # non-numeric by group: top categories per group
     lines = [f"Top categories of {col} by {by}:"]
     for g in order:
-        vc = (
-            df[df[by].astype(str) == g][col]
-            .dropna().astype(str).value_counts().head(10)
-        )
+        vc = df[df[by].astype(str) == g][col].dropna().astype(str).value_counts().head(10)
         if vc.empty:
             lines.append(f"- {g}: n=0")
         else:
-            lines.append(f"- {g}: " + ", ".join([f"{k} ({int(v)})" for k, v in vc.items()]))
+            lines.append(f"- {g}: " + ", ".join([f\"{k} ({int(v)})\" for k, v in vc.items()]))
     return "\n".join(lines)
