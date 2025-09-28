@@ -2,107 +2,120 @@
 from __future__ import annotations
 
 from typing import List, Tuple, Optional
+import re
 import numpy as np
 import pandas as pd
 
 
-# ========== Helper detection/coercion ==========
+# ---------- Numeric detection & coercion ----------
+
+_NUMERIC_NAME_HINT = re.compile(
+    r"(?:^|[_\W])(lat|lon|long|alt|elev|elevation|dist|distance|speed|x|y)(?:[_\W]|$)",
+    re.IGNORECASE,
+)
 
 def _coerce_numeric_series(s: pd.Series) -> pd.Series:
-    """
-    Try to coerce a series to numeric while preserving NaNs for non-convertibles.
-    """
+    """Coerce to numeric; non-convertibles -> NaN."""
     return pd.to_numeric(s, errors="coerce")
 
 
-def _is_effectively_numeric(s: pd.Series) -> bool:
+def _is_effectively_numeric(s: pd.Series, colname: str) -> bool:
     """
-    A column is treated as numeric if, after coercion, at least half of
-    the non-null entries are numeric and there is >1 distinct numeric value.
+    Treat a column as numeric if, after coercion:
+      - there are at least 3 numeric values, AND
+      - numeric values are at least 10% of the non-null entries
+    Also: if the name looks numeric-ish (lat/lon/alt/dist/speed/x/y) and there are ≥3
+    numeric values, accept it regardless of the 10% rule.
     """
-    coerced = _coerce_numeric_series(s)
-    nn = coerced.notna()
-    if nn.sum() == 0:
+    s_orig_nonnull = s.dropna()
+    if s_orig_nonnull.empty:
         return False
-    frac_numeric = nn.mean()
-    if frac_numeric < 0.5:
-        return False
-    return coerced[nn].nunique(dropna=True) > 1
+
+    coerced = _coerce_numeric_series(s_orig_nonnull)
+    n_numeric = int(coerced.notna().sum())
+    frac_numeric = n_numeric / max(1, len(s_orig_nonnull))
+
+    name_hint = bool(_NUMERIC_NAME_HINT.search(str(colname)))
+    if name_hint and n_numeric >= 3:
+        return True
+
+    return (n_numeric >= 3) and (frac_numeric >= 0.10)
 
 
 def _split_numeric_categorical(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     num_cols, cat_cols = [], []
     for c in df.columns:
-        s = df[c]
-        if _is_effectively_numeric(s):
+        if _is_effectively_numeric(df[c], c):
             num_cols.append(c)
         else:
             cat_cols.append(c)
     return num_cols, cat_cols
 
 
-# ========== Render helpers ==========
+# ---------- Rendering helpers ----------
 
-def _render_numeric_block(df: pd.DataFrame, cols: List[str], group_label: Optional[str] = None) -> List[str]:
+def _render_numeric_block(
+    df: pd.DataFrame, cols: List[str], group_label: Optional[str] = None
+) -> List[str]:
     lines: List[str] = []
-    if group_label is not None:
-        lines.append(f"- {group_label}:")
+    if cols:
+        if group_label is None:
+            lines.append("- Numeric:")
+        else:
+            lines.append(f"- {group_label} (numeric):")
     for c in cols:
-        s = _coerce_numeric_series(df[c])
-        # dropna for stats
-        vals = s.dropna()
+        vals = _coerce_numeric_series(df[c]).dropna()
         if vals.empty:
             stat = "n=0"
         else:
             n = int(vals.shape[0])
-            mean = np.nanmean(vals)
-            sd = np.nanstd(vals, ddof=1) if n > 1 else 0.0
-            med = np.nanmedian(vals)
-            vmin = np.nanmin(vals)
-            vmax = np.nanmax(vals)
+            mean = float(np.nanmean(vals))
+            sd = float(np.nanstd(vals, ddof=1)) if n > 1 else 0.0
+            med = float(np.nanmedian(vals))
+            vmin = float(np.nanmin(vals))
+            vmax = float(np.nanmax(vals))
             stat = f"n={n}, mean={mean:.3g}, sd={sd:.3g}, median={med:.3g}, min={vmin:.3g}, max={vmax:.3g}"
-        bullet_prefix = "  • " if group_label is not None else "- "
-        lines.append(f"{bullet_prefix}{c}: {stat}")
+        bullet = "  • " if group_label is not None else "  • "
+        lines.append(f"{bullet}{c}: {stat}")
     return lines
 
 
-def _render_categorical_block(df: pd.DataFrame, cols: List[str], group_label: Optional[str] = None, top_k: int = 5) -> List[str]:
+def _render_categorical_block(
+    df: pd.DataFrame, cols: List[str], group_label: Optional[str] = None, top_k: int = 5
+) -> List[str]:
     lines: List[str] = []
-    if group_label is not None:
-        # Add a header line only once for the categorical portion if needed
-        pass
+    if cols:
+        if group_label is None:
+            lines.append("- Categorical:")
+        else:
+            lines.append(f"- {group_label} (categorical):")
     for c in cols:
         s = df[c].astype(str)
-        # treat 'nan' string (from astype) as NaN for counts reporting
-        s_clean = s.replace({"nan": np.nan})
-        n = int(s_clean.notna().sum())
-        vc = s_clean.value_counts(dropna=True)
+        s = s.replace({"nan": np.nan})
+        n = int(s.notna().sum())
+        vc = s.value_counts(dropna=True)
         uniq = int(vc.shape[0])
-        top_parts = []
-        take = min(top_k, uniq)
-        for k, v in vc.head(take).items():
-            top_parts.append(f"{k} ({int(v)})")
-        top_str = ", ".join(top_parts) if top_parts else "—"
-        bullet_prefix = "  • " if group_label is not None else "- "
-        lines.append(f"{bullet_prefix}{c}: n={n}, unique={uniq}{', top=' if take else ''}{top_str if take else ''}")
+        head = vc.head(min(top_k, uniq))
+        if head.empty:
+            top_str = "—"
+        else:
+            top_str = ", ".join([f"{k} ({int(v)})" for k, v in head.items()])
+        lines.append(f"  • {c}: n={n}, unique={uniq}{', top=' if uniq else ''}{top_str if uniq else ''}")
     return lines
 
 
-# ========== Public API ==========
+# ---------- Public API ----------
 
 def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
-    """
-    Lightweight guidance string + examples based on observed schema.
-    """
     num_cols, cat_cols = _split_numeric_categorical(df)
     tips = []
     if num_cols and cat_cols:
-        tips.append("You can compare numeric outcomes across groups (t-test/ANOVA/Kruskal; Tukey/Dunn for post-hoc).")
+        tips.append("Compare numeric outcomes across groups (t-test/ANOVA/Kruskal; Tukey/Dunn for post-hoc).")
     if num_cols:
         tips.append("Explore correlations (Pearson/Spearman) or model with OLS/GLM.")
-        tips.append("Visualize with histogram/box/violin/bar and check normality.")
+        tips.append("Plot histogram/box/violin/bar; check normality.")
     if cat_cols:
-        tips.append("Test association between two categorical columns with Chi-square/Fisher.")
+        tips.append("Test association between categorical variables with Chi-square or Fisher's exact.")
     if not tips:
         tips.append("Upload a dataset or ask for help choosing an analysis.")
     tech = "- " + "\n- ".join(tips)
@@ -120,57 +133,47 @@ def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
     return tech, examples
 
 
-def quick_summary(df: pd.DataFrame, col: Optional[str] = "data", by: Optional[str] = None, top_k: int = 5) -> str:
+def quick_summary(
+    df: pd.DataFrame,
+    col: Optional[str] = "data",
+    by: Optional[str] = None,
+    top_k: int = 5,
+) -> str:
     """
-    Summarize dataset or a single column.
-      - If `by` is provided: summarize within each level of `by`.
-      - Numeric columns: n, mean, sd, median, min, max.
-      - Non-numeric columns: n, unique, top values with counts.
-    The `col="data"` (or None) means summarize ALL columns.
+    Summarize the dataset or a column.
+      • Numeric: n, mean, sd, median, min, max
+      • Categorical: n, unique, top values (with counts)
+    If `by` is provided, summaries are computed per group.
     """
-    # Normalize flags
+    # Resolve "all columns" mode
     summarize_all = (col is None) or (str(col).strip().lower() in {"data", "dataset", "all", "*"})
-    header_name = by if by else (col if not summarize_all else "data")
-
-    # Column sets
     if summarize_all:
         num_cols, cat_cols = _split_numeric_categorical(df)
     else:
-        # single column path
         if col not in df.columns:
             raise ValueError(f"Column '{col}' not found.")
-        if _is_effectively_numeric(df[col]):
+        if _is_effectively_numeric(df[col], col):
             num_cols, cat_cols = [col], []
         else:
             num_cols, cat_cols = [], [col]
 
     lines: List[str] = []
+    # Ungrouped
     if by is None:
         title = f"Dataset summary ({'all columns' if summarize_all else col}):"
         lines.append(title)
-        # Numeric block
-        if num_cols:
-            lines.append("- Numeric:")
-            lines.extend(_render_numeric_block(df, num_cols, group_label=None))
-        # Categorical block
-        if cat_cols:
-            lines.append("- Categorical:")
-            lines.extend(_render_categorical_block(df, cat_cols, group_label=None, top_k=top_k))
+        lines.extend(_render_numeric_block(df, num_cols, group_label=None))
+        lines.extend(_render_categorical_block(df, cat_cols, group_label=None, top_k=top_k))
         return "\n".join(lines)
 
-    # Grouped summary
+    # Grouped
     if by not in df.columns:
         raise ValueError(f"Group column '{by}' not found.")
 
     title = f"Dataset summary by {by}:"
     lines.append(title)
-    # group with dropna=False to show NaN group if present
     for level, gdf in df.groupby(by, dropna=False):
         group_label = f"{by} = {level}"
-        # Numeric within group
-        if num_cols:
-            lines.extend(_render_numeric_block(gdf, num_cols, group_label=group_label))
-        # Categorical within group
-        if cat_cols:
-            lines.extend(_render_categorical_block(gdf, cat_cols, group_label=group_label, top_k=top_k))
+        lines.extend(_render_numeric_block(gdf, num_cols, group_label=group_label))
+        lines.extend(_render_categorical_block(gdf, cat_cols, group_label=group_label, top_k=top_k))
     return "\n".join(lines)
