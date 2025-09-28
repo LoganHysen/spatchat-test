@@ -30,10 +30,7 @@ from .correlations import (
 from .associations import chisq_test
 
 # Modeling
-from .modeling import (
-    run_ols,
-    run_glm,
-)
+from .modeling import run_ols, run_glm
 
 # Descriptives & distribution checks
 from .descriptives import (
@@ -41,16 +38,11 @@ from .descriptives import (
     plot_box,
     plot_violin,
     check_normality,
+    quick_summary,   # <-- move quick_summary here
 )
 
 # Power
-from .power import (
-    power_ttest_ind,
-    power_anova_oneway,
-)
+from .power import power_ttest_ind, power_anova_oneway
 
-# Recommendations & summaries
-from .recommendations import (
-    quick_summary,
-    recommend_text_and_examples,
-)
+# Recommendations (only)
+from .recommendations import recommend_text_and_examples
