@@ -1,237 +1,190 @@
 # stats/recommendations.py
-from __future__ import annotations
-
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import re
 import numpy as np
 import pandas as pd
 
-__all__ = ["recommend_text_and_examples", "quick_summary"]
+from core_utils import usable_numeric_cols, is_integer_like
 
-# ------------------------------------------------------------
-# Numeric detection / coercion
-# ------------------------------------------------------------
-
-# Helpful name hints: treat these as numeric if they have at least a few numeric values
-_NUMERIC_NAME_HINT = re.compile(
-    r"(?:^|[_\W])(lat|latitude|lon|long|longitude|alt|altitude|elev|elevation|dist|distance|speed|depth|height|weight|x|y)(?:[_\W]|$)",
-    re.IGNORECASE,
-)
-
-def _coerce_numeric_series(s: pd.Series) -> pd.Series:
-    """
-    Coerce a series to numeric safely; non-convertibles become NaN.
-    Does not raise on strings like 'F24'—those simply become NaN.
-    """
-    return pd.to_numeric(s, errors="coerce")
+__all__ = ["recommend_text_and_examples"]
 
 
-def _is_numeric_by_dtype(s: pd.Series) -> bool:
-    # Treat bool as categorical, not numeric, for summaries by group
-    return (pd.api.types.is_integer_dtype(s) or pd.api.types.is_float_dtype(s)) and not pd.api.types.is_bool_dtype(s)
+# ----------------------------
+# Lightweight schema helpers
+# ----------------------------
+_ID_NAME_PAT = re.compile(r"(?:^|[_\W])(id|identifier|index|subject|animal|record|row)(?:[_\W]|$)", re.I)
 
-
-def _is_effectively_numeric(s: pd.Series, colname: str) -> bool:
-    """
-    Decide if a column should be summarized as numeric.
-
-    Rules (global, not per-group):
-      - If dtype is numeric (int/float), accept.
-      - Else coerce; consider numeric if:
-          * there are at least 3 numeric values, AND
-          * numeric values are >= 10% of non-null entries, OR
-          * column name hints numeric AND numeric values >= 3.
-    """
-    if _is_numeric_by_dtype(s):
+def _is_id_like(df: pd.DataFrame, col: str) -> bool:
+    name = str(col).strip().lower()
+    if _ID_NAME_PAT.search(name) or name.endswith("_id"):
         return True
-
-    s_nonnull = s.dropna()
-    if s_nonnull.empty:
+    s = df[col].dropna()
+    if s.empty or not pd.api.types.is_numeric_dtype(s):
         return False
+    as_float = s.astype(float)
+    if not np.all(np.isfinite(as_float)):
+        return False
+    # mostly integers and mostly consecutive → likely an ID
+    frac = np.abs(as_float - np.round(as_float))
+    if (frac > 1e-9).mean() > 0.05:
+        return False
+    u = np.sort(pd.unique(np.round(as_float).astype(int)))
+    if len(u) < 5:
+        return False
+    diffs = np.diff(u)
+    if len(diffs) == 0:
+        return False
+    return (diffs == 1).mean() >= 0.9
 
-    coerced = _coerce_numeric_series(s_nonnull)
-    n_numeric = int(coerced.notna().sum())
-    frac_numeric = n_numeric / max(1, len(s_nonnull))
-    name_hint = bool(_NUMERIC_NAME_HINT.search(str(colname)))
 
-    if name_hint and n_numeric >= 3:
-        return True
-    return (n_numeric >= 3) and (frac_numeric >= 0.10)
+def _infer_schema(df: pd.DataFrame) -> Dict:
+    n, p = df.shape
+    numeric_all = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 
-
-def _split_numeric_categorical_global(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    """
-    Classify columns once on the whole dataset (not per group).
-    This avoids losing columns in small groups.
-    """
-    num_cols, cat_cols = [], []
+    # categorical if non-numeric and low cardinality
+    categorical: List[str] = []
     for c in df.columns:
-        s = df[c]
-        if _is_effectively_numeric(s, c):
-            num_cols.append(c)
-        else:
-            cat_cols.append(c)
-    return num_cols, cat_cols
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            uniq = df[c].nunique(dropna=True)
+            if uniq <= max(20, int(0.2 * max(n, 1))):
+                categorical.append(c)
+
+    # include integer-like low-card numeric as categorical (e.g., 0/1; 1..5 Likert)
+    cat_thresh = min(5, max(2, int(0.1 * max(n, 1))))
+    for c in numeric_all:
+        uniq = df[c].nunique(dropna=True)
+        if is_integer_like(df[c]) and uniq <= cat_thresh:
+            categorical.append(c)
+
+    # common group-like names
+    for c in ["group", "sex", "treatment", "class", "category"]:
+        if c in df.columns and c not in categorical:
+            categorical.append(c)
+
+    # binary detection
+    binary = []
+    for c in df.columns:
+        u = df[c].nunique(dropna=True)
+        if u == 2 and (not pd.api.types.is_numeric_dtype(df[c]) or is_integer_like(df[c])):
+            binary.append(c)
+
+    # drop obvious IDs from “numeric candidates”
+    numeric_safe = [c for c in numeric_all if not _is_id_like(df, c)]
+    if not numeric_safe and numeric_all:
+        numeric_safe = numeric_all
+
+    return {
+        "n_rows": n,
+        "n_cols": p,
+        "numeric_all": numeric_all,
+        "numeric_safe": numeric_safe,
+        "categorical": list(dict.fromkeys(categorical)),  # preserve order, dedupe
+        "binary": binary,
+    }
 
 
-# ------------------------------------------------------------
-# Render helpers
-# ------------------------------------------------------------
-
-def _fmt_float(x: float) -> str:
-    # Compact numeric format for readability
-    try:
-        return f"{float(x):.3g}"
-    except Exception:
-        return "nan"
-
-
-def _render_numeric_block(df: pd.DataFrame, cols: List[str], group_label: Optional[str]) -> List[str]:
-    """
-    Render numeric summaries for given columns within df (which may be a group slice).
-    Always lists every numeric column; if a group has 0 numeric entries for a column,
-    we still show 'n=0'.
-    """
-    lines: List[str] = []
-    if not cols:
-        return lines
-    if group_label is None:
-        lines.append("- Numeric:")
-    else:
-        lines.append(f"- {group_label} (numeric):")
-
-    for c in cols:
-        vals = _coerce_numeric_series(df[c]).dropna()
-        if vals.empty:
-            stat = "n=0"
-        else:
-            n = int(vals.shape[0])
-            mean = _fmt_float(np.nanmean(vals))
-            sd = _fmt_float(np.nanstd(vals, ddof=1)) if n > 1 else "0"
-            med = _fmt_float(np.nanmedian(vals))
-            vmin = _fmt_float(np.nanmin(vals))
-            vmax = _fmt_float(np.nanmax(vals))
-            stat = f"n={n}, mean={mean}, sd={sd}, median={med}, min={vmin}, max={vmax}"
-        lines.append(f"  • {c}: {stat}")
-    return lines
-
-
-def _render_categorical_block(df: pd.DataFrame, cols: List[str], group_label: Optional[str], top_k: int) -> List[str]:
-    """
-    Render categorical summaries. Always reports n and unique for each column.
-    Shows up to top_k most frequent values with counts; if all unique, the 'top' list is omitted.
-    """
-    lines: List[str] = []
-    if not cols:
-        return lines
-    if group_label is None:
-        lines.append("- Categorical:")
-    else:
-        lines.append(f"- {group_label} (categorical):")
-
-    for c in cols:
-        s = df[c]
-        # Keep original NaNs for counts; convert to string just for value listing
-        n_non_null = int(s.notna().sum())
-        vc = s.astype(str).replace({"nan": np.nan}).value_counts(dropna=True)
-        uniq = int(vc.shape[0])
-
-        if uniq == 0:
-            lines.append(f"  • {c}: n=0, unique=0")
-            continue
-
-        # Build top list if there is any repetition; for all-unique, skip top list
-        head = vc.head(min(top_k, uniq))
-        repeated_exist = any(v > 1 for v in head.values)
-        if repeated_exist:
-            top_str = ", ".join([f"{k} ({int(v)})" for k, v in head.items()])
-            lines.append(f"  • {c}: n={n_non_null}, unique={uniq}, top={top_str}")
-        else:
-            lines.append(f"  • {c}: n={n_non_null}, unique={uniq}")
-    return lines
-
-
-# ------------------------------------------------------------
+# ----------------------------
 # Public API
-# ------------------------------------------------------------
-
+# ----------------------------
 def recommend_text_and_examples(df: pd.DataFrame) -> Tuple[str, str]:
     """
-    Lightweight guidance + examples based on observed schema.
+    Returns:
+      tech_text: human-readable overview + suggested analyses
+      examples_text: short “say it like this” prompts for the chat
     """
-    num_cols, cat_cols = _split_numeric_categorical_global(df)
-    bullets = []
-    if num_cols and cat_cols:
-        bullets.append("Compare numeric outcomes across groups (t-test / ANOVA / Kruskal; Tukey / Dunn for post-hoc).")
-    if num_cols:
-        bullets.append("Explore correlations (Pearson/Spearman) or model with OLS/GLM.")
-        bullets.append("Plot histogram/box/violin/bar; check normality with a QQ plot.")
-    if cat_cols:
-        bullets.append("Test association between categorical variables (Chi-square / Fisher's exact).")
-    if not bullets:
-        bullets.append("Upload a dataset or ask for help choosing an analysis.")
+    info = _infer_schema(df)
+    n, p = info["n_rows"], info["n_cols"]
+    nums_all = info["numeric_all"]
+    nums_safe = info["numeric_safe"]
+    cats = info["categorical"]
+    bins = info["binary"]
 
-    tech = "- " + "\n- ".join(bullets)
+    # pick a primary numeric outcome
+    y_num: Optional[str] = nums_safe[0] if nums_safe else (nums_all[0] if nums_all else None)
 
-    ex = []
-    if num_cols and cat_cols:
-        ex.append(f"ttest {num_cols[0]} by {cat_cols[0]}")
-    if len(cat_cols) >= 2:
-        ex.append(f"chi-square {cat_cols[0]} vs {cat_cols[1]}")
-    if len(num_cols) >= 2:
-        ex.append(f"correlation {num_cols[0]} vs {num_cols[1]} (spearman)")
-    if num_cols:
-        ex.append(f"histogram {num_cols[0]} (bins=40)")
-    examples = "• " + "\n• ".join(ex) if ex else "• what can I do with my data?"
-    return tech, examples
-
-
-def quick_summary(
-    df: pd.DataFrame,
-    col: Optional[str] = "data",
-    by: Optional[str] = None,
-    top_k: int = 5,
-) -> str:
-    """
-    Summarize dataset or a column.
-
-    - Numeric columns: n, mean, sd, median, min, max
-    - Non-numeric columns: n, unique, top values with counts (up to top_k).
-      If all values are unique, 'top' list is omitted but n/unique are still shown.
-
-    If `by` is provided, summaries are emitted per level of `by`, using a global
-    column classification so groups don't "lose" columns.
-    """
-    # Figure out whether we’re summarizing a single column or the entire dataset
-    summarize_all = (col is None) or (str(col).strip().lower() in {"data", "dataset", "all", "*"})
-    if summarize_all:
-        numeric_cols, categorical_cols = _split_numeric_categorical_global(df)
-    else:
-        if col not in df.columns:
-            raise ValueError(f"Column '{col}' not found.")
-        # Classify single column
-        if _is_effectively_numeric(df[col], col):
-            numeric_cols, categorical_cols = [col], []
+    def _valid_group(col: str, outcome: Optional[str]) -> bool:
+        if outcome and col == outcome:
+            return False
+        u = df[col].nunique(dropna=True)
+        if pd.api.types.is_numeric_dtype(df[col]):
+            return u >= 2 and is_integer_like(df[col])
         else:
-            numeric_cols, categorical_cols = [], [col]
+            return u >= 2
 
-    # Ungrouped summary
-    if by is None:
-        title = f"Dataset summary ({'all columns' if summarize_all else col}):"
-        parts: List[str] = [title]
-        parts.extend(_render_numeric_block(df, numeric_cols, group_label=None))
-        parts.extend(_render_categorical_block(df, categorical_cols, group_label=None, top_k=top_k))
-        return "\n".join(parts)
+    g_bin = next((c for c in bins if _valid_group(c, y_num)), None)
+    g_multi = next((c for c in cats if df[c].nunique(dropna=True) >= 3 and _valid_group(c, y_num)), None)
 
-    # Grouped summary
-    if by not in df.columns:
-        raise ValueError(f"Group column '{by}' not found.")
+    # Overview
+    overview_lines = [f"Dataset overview: n={n} rows, p={p} columns."]
+    if nums_all:
+        preview_nums = ", ".join(map(str, nums_all[:8])) + ("…" if len(nums_all) > 8 else "")
+        overview_lines.append(f"- Numeric columns ({len(nums_all)}): {preview_nums}")
+    if cats:
+        preview_cats = ", ".join(map(str, cats[:8])) + ("…" if len(cats) > 8 else "")
+        overview_lines.append(f"- Categorical/low-cardinality ({len(cats)}): {preview_cats}")
 
-    title = f"Dataset summary by {by}:"
-    parts: List[str] = [title]
-    # groupby with dropna=False so NaN group (if any) is visible
-    for level, gdf in df.groupby(by, dropna=False):
-        group_label = f"{by} = {level}"
-        parts.extend(_render_numeric_block(gdf, numeric_cols, group_label=group_label))
-        parts.extend(_render_categorical_block(gdf, categorical_cols, group_label=group_label, top_k=top_k))
-    return "\n".join(parts)
+    # Recommendations
+    rec_lines = ["Here are some analysis ideas you can run next:"]
+    if y_num:
+        rec_lines.append(f"• See a quick summary of **{y_num}** (mean, sd, min/max).")
+        rec_lines.append(f"• **Histogram** to see the shape of **{y_num}**.")
+    if y_num and g_bin:
+        rec_lines.append(f"• Compare average **{y_num}** between the two groups in **{g_bin}** (t-test).")
+        rec_lines.append(f"• **Bar chart with error bars** for **{y_num}** by **{g_bin}**.")
+        rec_lines.append(f"• **Mann–Whitney U** (rank-sum) for **{y_num}** by **{g_bin}** (nonparametric).")
+        rec_lines.append(f"• **Point-biserial** correlation of **{y_num}** with **{g_bin}**.")
+        rec_lines.append(f"• **Levene’s test** for equal variances across **{g_bin}**.")
+    if y_num and g_multi:
+        rec_lines.append(f"• Compare **{y_num}** across levels of **{g_multi}** (one-way ANOVA).")
+        rec_lines.append(f"• **Post-hoc Tukey HSD** for pairwise differences.")
+        rec_lines.append(f"• **Kruskal–Wallis** across **{g_multi}** (nonparametric).")
+        rec_lines.append(f"• **Post-hoc Dunn’s test** with p-adjustment.")
+        rec_lines.append(f"• **Box/violin plots** of **{y_num}** across **{g_multi}**.")
+    if len(nums_safe) >= 2:
+        rec_lines.append(f"• **Correlation**: Pearson or Spearman between **{nums_safe[0]}** and **{nums_safe[1]}**.")
+    if len(nums_safe) >= 3:
+        rec_lines.append(f"• **Correlation heatmap** for numeric columns.")
+        rec_lines.append(f"• **Partial correlation** between two variables controlling for others.")
+        rec_lines.append(f"• See how one value predicts another (linear regression), e.g., **{nums_safe[0]} ~ {nums_safe[1]}**.")
+    if len(cats) >= 2:
+        rec_lines.append("• **Chi-square test** of association between two categorical columns.")
+    rec_lines.append("• **Normality check** with a QQ plot.")
+    if g_bin:
+        rec_lines.append("• **Power analysis** for a t-test to estimate sample size.")
+    if g_multi:
+        rec_lines.append("• **Power analysis** for one-way ANOVA to estimate sample size.")
+
+    tech_text = "\n".join(overview_lines + [""] + rec_lines)
+
+    # Examples
+    ex = ["Here are some things you can say:"]
+    if y_num:
+        ex.append(f'• "What is the average {y_num}?"')
+        ex.append(f'• "Show a histogram of {y_num}."')
+    if y_num and g_bin:
+        ex.append(f'• "I want to do a t-test on {y_num} by {g_bin}."')
+        ex.append(f'• "Mann-Whitney U test on {y_num} by {g_bin}."')
+        ex.append(f'• "Point-biserial correlation {y_num} by {g_bin}."')
+        ex.append(f'• "Levene\'s test for {y_num} by {g_bin}."')
+    if y_num and g_multi:
+        ex.append(f'• "Run a one-way ANOVA of {y_num} by {g_multi}."')
+        ex.append(f'• "Tukey HSD for {y_num} by {g_multi}."')
+        ex.append(f'• "Kruskal-Wallis on {y_num} by {g_multi}."')
+        ex.append(f'• "Dunn\'s post-hoc for {y_num} by {g_multi}."')
+        ex.append(f'• "Show box and violin plots for {y_num} by {g_multi}."')
+    if len(nums_safe) >= 2:
+        ex.append(f'• "Pearson correlation between {nums_safe[0]} and {nums_safe[1]}."')
+        ex.append(f'• "Spearman correlation {nums_safe[0]} vs {nums_safe[1]}."')
+        ex.append('• "Correlation heatmap of numeric columns."')
+        ex.append('• "Partial correlation height and score controlling for age, weight."')
+        ex.append(f'• "Fit a linear regression: {nums_safe[0]} ~ {nums_safe[1]}."')
+    if len(cats) >= 2:
+        ex.append('• "Chi-square test of sex by group."')
+    ex.append('• "Check normality of the main outcome and show a QQ plot."')
+    if g_bin:
+        ex.append('• "Power analysis for a t-test with 80% power and effect size 0.5."')
+    if g_multi:
+        ex.append('• "Power analysis for a one-way ANOVA with 3 groups and 80% power."')
+
+    examples_text = "\n".join(ex)
+    return tech_text, examples_text
