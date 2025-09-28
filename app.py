@@ -4,6 +4,8 @@
 # Imports
 # =========================
 import os
+import re
+import json
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
@@ -32,7 +34,7 @@ from report_utils import (
 )
 
 # Plot/theme
-from plot_helpers import set_house_style
+from plot_helpers import set_house_style, bar_with_error_plot
 
 # Core utils for schema-ish decisions
 from core_utils import usable_numeric_cols, is_integer_like
@@ -95,7 +97,7 @@ set_house_style()  # apply house plotting theme once
 
 
 # =========================
-# Small helpers
+# Small helpers (incl. robust column resolution)
 # =========================
 def _fence(text: str) -> str:
     """Wrap multi-line stats text to prevent Markdown table parsing in the chat UI."""
@@ -115,6 +117,84 @@ def _step(paths: List[str], idx: int, delta: int) -> Tuple[Optional[str], int]:
     n = len(paths)
     new_idx = (idx + delta) % n
     return paths[new_idx], new_idx
+
+
+def _col_lookup_map(df: pd.DataFrame) -> Dict[str, str]:
+    """Map lowercase stripped column name -> actual column name (first match)."""
+    m = {}
+    for c in df.columns:
+        key = str(c).strip().lower()
+        if key not in m:
+            m[key] = c
+    return m
+
+
+_SPECIAL_WHOLE_DATA = {"data", "dataset", "everything", "all", "*"}
+
+
+def _resolve_colname(df: pd.DataFrame, name: Optional[str]) -> Optional[str]:
+    """Resolve a requested column name case-insensitively; pass through 'data/dataset' tokens."""
+    if name is None:
+        return None
+    lower = str(name).strip().lower()
+    if lower in _SPECIAL_WHOLE_DATA:
+        return "data"
+    m = _col_lookup_map(df)
+    return m.get(lower, name)
+
+
+def _resolve_many(df: pd.DataFrame, names: Optional[List[str]]) -> List[str]:
+    if not names:
+        return []
+    out = []
+    for n in names:
+        r = _resolve_colname(df, n)
+        if r is not None:
+            out.append(r)
+    return out
+
+
+# Lightweight resolver for patsy-style formulas: replace identifiers with real-cased columns.
+# This is conservative: we replace only bare-word tokens that match a column ignoring case.
+_IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+
+
+def _resolve_formula(df: pd.DataFrame, formula: str) -> str:
+    m = _col_lookup_map(df)
+    # tokens that we should not rewrite (common patsy keywords/functions/operators)
+    stop = {
+        "C", "I", "np", "log", "exp", "sin", "cos", "BS", "bs", "Poly", "poly",
+        "year", "month", "day", "Q", "CIs", "True", "False"
+    }
+    def repl(tok: re.Match) -> str:
+        w = tok.group(0)
+        lw = w.lower()
+        if w in stop:
+            return w
+        return m.get(lw, w)
+    return _IDENT_RE.sub(repl, formula)
+
+
+def need_value_and_group(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    """
+    Helper used when the user omits value/group; prefers common group-like columns.
+    """
+    nums = usable_numeric_cols(df)
+    groups = []
+    for c in df.columns:
+        if df[c].nunique(dropna=True) >= 2:
+            if not pd.api.types.is_numeric_dtype(df[c]) or is_integer_like(df[c]):
+                groups.append(c)
+    prefer = ["sex", "group", "treatment", "class", "category"]
+    ordered_g = [c for c in prefer if c in [g.lower() for g in groups]]
+    # keep original casing from df, but sort by our preference list first
+    ordered = []
+    for pref in prefer:
+        for g in groups:
+            if str(g).strip().lower() == pref and g not in ordered:
+                ordered.append(g)
+    ordered += [g for g in groups if g not in ordered]
+    return nums, ordered
 
 
 # =========================
@@ -157,21 +237,6 @@ def handle_upload(file):
         )
 
 
-def need_value_and_group(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    """
-    Helper used when the user omits value/group; prefers common group-like columns.
-    """
-    nums = usable_numeric_cols(df)
-    groups = []
-    for c in df.columns:
-        if df[c].nunique(dropna=True) >= 2:
-            if not pd.api.types.is_numeric_dtype(df[c]) or is_integer_like(df[c]):
-                groups.append(c)
-    prefer = ["sex", "group", "treatment", "class", "category"]
-    ordered_g = [c for c in prefer if c in groups] + [c for c in groups if c not in prefer]
-    return nums, ordered_g
-
-
 def handle_chat(chat_history, user_message, data_preview):
     """
     Core router for user requests. The UI passes (chat_history, user_input, data_preview)
@@ -183,23 +248,14 @@ def handle_chat(chat_history, user_message, data_preview):
     chat_history = list(chat_history)
     text = str(user_message or "").strip()
 
-    # ----------------------------
-    # Prefer deterministic parser FIRST, then LLM as fallback
-    # ----------------------------
     parsed = None
     llm_error_text = None
+    try:
+        tool, _ = ask_llm(chat_history, text)
+        parsed = tool
+    except Exception as e:
+        llm_error_text = f"(LLM unavailable: {e})"
 
-    lp = local_parse(text)
-    if lp:
-        parsed = lp
-    else:
-        try:
-            tool, _ = ask_llm(chat_history, text)
-            parsed = tool
-        except Exception as e:
-            llm_error_text = f"(LLM unavailable: {e})"
-
-    # If nothing, try local_parse once more defensively
     if not parsed:
         lp = local_parse(text)
         if lp:
@@ -234,24 +290,15 @@ def handle_chat(chat_history, user_message, data_preview):
             idx,
         )
 
-    # Now that we have data, we can safely normalize summary intents
-    df = cached_df.copy()
     action = parsed.get("action")
     args = sanitize_args(action, parsed.get("args", {}))
+    df = cached_df.copy()
 
-    # Heuristic normalization for "summarize data ..." to force full-dataset summary
-    if action == "summary":
-        user_lower = f" {text.lower()} "
-        special_all = {"*", "data", "dataset", "everything", "all"}
-        # If the user phrasing clearly implies whole dataset, force it
-        if any(tok in user_lower for tok in [" summarize data", "summary data", "summarize the data", " dataset", " everything", " summarize all", " summary all"]):
-            args["col"] = "data"
-        # If no column supplied, default to whole dataset
-        if not args.get("col"):
-            args["col"] = "data"
-        # If a column name is present but not an actual column and there's a ' by ' phrase, prefer whole dataset by group
-        if args.get("col") and (args["col"] not in df.columns) and (" by " in user_lower) and (args["col"].lower() not in special_all):
-            args["col"] = "data"
+    # --- central resolution for all arg column names ---
+    def _rg(name: Optional[str]) -> Optional[str]:
+        return _resolve_colname(df, name)
+    def _rg_many(names: Optional[List[str]]) -> List[str]:
+        return _resolve_many(df, names)
 
     sections: List[Tuple[str, str, Optional[np.ndarray]]] = []
     image_paths: List[str] = []
@@ -270,9 +317,10 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- Summary --------
         if action == "summary":
-            col = args.get("col")
-            by = args.get("by")
-            # Let quick_summary handle validation and produce friendly messages
+            col = _rg(args.get("col"))
+            by  = _rg(args.get("by"))
+            if col is None or str(col).strip().lower() in _SPECIAL_WHOLE_DATA:
+                col = "data"
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
@@ -283,13 +331,13 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- t-test --------
         if action == "ttest":
-            value = args.get("value")
-            group = args.get("group")
+            value = _rg(args.get("value"))
+            group = _rg(args.get("group"))
             if not value or not group:
                 nums, groups = need_value_and_group(df)
                 pending.update({"action": "ttest", "need": "value" if not value else "group", "args": {"value": value, "group": group}})
-                ask = ("Which numeric outcome should I test? Candidates: " + ", ".join(nums)
-                       if not value else "Which group column? Candidates: " + ", ".join(groups))
+                ask = ("Which numeric outcome should I test? Candidates: " + ", ".join(map(str, nums))
+                       if not value else "Which group column? Candidates: " + ", ".join(map(str, groups)))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -306,12 +354,12 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- ANOVA --------
         elif action == "anova":
-            value = args.get("value"); group = args.get("group")
+            value = _rg(args.get("value")); group = _rg(args.get("group"))
             if not value or not group:
                 nums, groups = need_value_and_group(df)
                 pending.update({"action": "anova", "need": "value" if not value else "group", "args": {"value": value, "group": group}})
-                ask = ("Which numeric outcome for ANOVA? Candidates: " + ", ".join(nums)
-                       if not value else "Which group column for ANOVA? Candidates: " + ", ".join(groups))
+                ask = ("Which numeric outcome for ANOVA? Candidates: " + ", ".join(map(str, nums))
+                       if not value else "Which group column for ANOVA? Candidates: " + ", ".join(map(str, groups)))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -324,11 +372,11 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- POSTHOC: TUKEY --------
         elif action == "posthoc_tukey":
-            value = args.get("value"); group = args.get("group")
+            value = _rg(args.get("value")); group = _rg(args.get("group"))
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Tukey? Candidates: " + ", ".join(nums)
-                       if not value else "Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
+                ask = ("Which numeric outcome for Tukey? Candidates: " + ", ".join(map(str, nums))
+                       if not value else "Which group column (≥2 levels)? Candidates: " + ", ".join(map(str, groups)))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -341,11 +389,11 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- KRUSKAL --------
         elif action == "kruskal":
-            value = args.get("value"); group = args.get("group")
+            value = _rg(args.get("value")); group = _rg(args.get("group"))
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Kruskal–Wallis? Candidates: " + ", ".join(nums)
-                       if not value else "Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
+                ask = ("Which numeric outcome for Kruskal–Wallis? Candidates: " + ", ".join(map(str, nums))
+                       if not value else "Which group column (≥2 levels)? Candidates: " + ", ".join(map(str, groups)))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -358,11 +406,11 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- POSTHOC: DUNN --------
         elif action == "posthoc_dunn":
-            value = args.get("value"); group = args.get("group"); padj = args.get("p_adjust", "holm")
+            value = _rg(args.get("value")); group = _rg(args.get("group")); padj = args.get("p_adjust", "holm")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Dunn’s test? Candidates: " + ", ".join(nums)
-                       if not value else "Which group column (≥2 levels)? Candidates: " + ", ".join(groups))
+                ask = ("Which numeric outcome for Dunn’s test? Candidates: " + ", ".join(map(str, nums))
+                       if not value else "Which group column (≥2 levels)? Candidates: " + ", ".join(map(str, groups)))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -373,10 +421,10 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- CHI-SQUARE / FISHER --------
         elif action == "chisq":
-            row = args.get("row"); col = args.get("col"); exact = bool(args.get("exact", False))
+            row = _rg(args.get("row")); col = _rg(args.get("col")); exact = bool(args.get("exact", False))
             if not row or not col:
                 cats = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
-                ask = "Which two categorical columns for chi-square? Candidates: " + ", ".join(cats)
+                ask = "Which two categorical columns for chi-square? Candidates: " + ", ".join(map(str, cats))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -391,7 +439,8 @@ def handle_chat(chat_history, user_message, data_preview):
         elif action == "corr":
             if bool(args.get("matrix", False)):
                 method = args.get("method", "pearson")
-                txt, imgs = corr_matrix_plot(df, cols=args.get("cols"), method=method)
+                cols = _rg_many(args.get("cols"))
+                txt, imgs = corr_matrix_plot(df, cols=cols, method=method)
                 sections.append(("Correlation matrix", txt, None))
                 for i, im in enumerate(imgs):
                     image_paths.append(save_image_np(im, f"corr_matrix_{method}_{i+1}.png"))
@@ -399,10 +448,10 @@ def handle_chat(chat_history, user_message, data_preview):
                     [{"role": "user", "content": text}, {"role": "assistant", "content": "Correlation matrix generated."}]
                 )
             else:
-                x = args.get("x"); y = args.get("y"); method = args.get("method", "pearson")
+                x = _rg(args.get("x")); y = _rg(args.get("y")); method = args.get("method", "pearson")
                 if not x or not y:
                     nums = usable_numeric_cols(df)
-                    ask = "Which two numeric columns for correlation? Candidates: " + ", ".join(nums)
+                    ask = "Which two numeric columns for correlation? Candidates: " + ", ".join(map(str, nums))
                     chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                     preview, paths, idx = _safe_last([])
                     return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -415,10 +464,10 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- PARTIAL CORRELATION --------
         elif action == "pcorr":
-            x = args.get("x"); y = args.get("y"); ctrls = args.get("controls", []); method = args.get("method", "pearson")
+            x = _rg(args.get("x")); y = _rg(args.get("y")); ctrls = _rg_many(args.get("controls", [])); method = args.get("method", "pearson")
             if not x or not y or not ctrls:
                 nums = usable_numeric_cols(df)
-                ask = "Specify: partial correlation <x> and <y> controlling for <a, b>. Numeric candidates: " + ", ".join(nums)
+                ask = "Specify: partial correlation <x> and <y> controlling for <a, b>. Numeric candidates: " + ", ".join(map(str, nums))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -431,12 +480,12 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- POINT-BISERIAL --------
         elif action == "pbiserial":
-            value = args.get("value"); group = args.get("group")
+            value = _rg(args.get("value")); group = _rg(args.get("group"))
             if not value or not group:
                 nums = usable_numeric_cols(df)
                 groups = [c for c in df.columns if df[c].nunique(dropna=True) == 2]
-                ask = ("Which numeric outcome for point-biserial? Candidates: " + ", ".join(nums)
-                       if not value else "Which binary group? Candidates: " + ", ".join(groups))
+                ask = ("Which numeric outcome for point-biserial? Candidates: " + ", ".join(map(str, nums))
+                       if not value else "Which binary group? Candidates: " + ", ".join(map(str, groups)))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -449,11 +498,11 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- MANN–WHITNEY --------
         elif action == "mwutest":
-            value = args.get("value"); group = args.get("group")
+            value = _rg(args.get("value")); group = _rg(args.get("group"))
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Mann–Whitney? Candidates: " + ", ".join(nums)
-                       if not value else "Which group column (2 levels needed)? Candidates: " + ", ".join(groups))
+                ask = ("Which numeric outcome for Mann–Whitney? Candidates: " + ", ".join(map(str, nums))
+                       if not value else "Which group column (2 levels needed)? Candidates: " + ", ".join(map(str, groups)))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -466,10 +515,10 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- WILCOXON SIGNED-RANK --------
         elif action == "wilcoxon":
-            a = args.get("a"); b = args.get("b")
+            a = _rg(args.get("a")); b = _rg(args.get("b"))
             if not a or not b:
                 nums = usable_numeric_cols(df)
-                ask = "Which two columns are paired? Example: 'wilcoxon pre vs post'. Candidates: " + ", ".join(nums)
+                ask = "Which two columns are paired? Example: 'wilcoxon pre vs post'. Candidates: " + ", ".join(map(str, nums))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -482,11 +531,11 @@ def handle_chat(chat_history, user_message, data_preview):
 
         # -------- LEVENE --------
         elif action == "levene":
-            value = args.get("value"); group = args.get("group"); center = args.get("center", "median")
+            value = _rg(args.get("value")); group = _rg(args.get("group")); center = args.get("center", "median")
             if not value or not group:
                 nums, groups = need_value_and_group(df)
-                ask = ("Which numeric outcome for Levene? Candidates: " + ", ".join(nums)
-                       if not value else "Which group column? Candidates: " + ", ".join(groups))
+                ask = ("Which numeric outcome for Levene? Candidates: " + ", ".join(map(str, nums))
+                       if not value else "Which group column? Candidates: " + ", ".join(map(str, groups)))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
@@ -504,6 +553,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
 
+            formula = _resolve_formula(df, formula)
             txt, imgs = run_ols(df, formula=formula)
             sections.append(("OLS", txt, None))
             for i, im in enumerate(imgs):
@@ -519,6 +569,7 @@ def handle_chat(chat_history, user_message, data_preview):
                 preview, paths, idx = _safe_last([])
                 return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
 
+            formula = _resolve_formula(df, formula)
             txt, imgs = run_glm(df, formula=formula, family=family)
             sections.append((f"GLM ({family})", txt, None))
             for i, im in enumerate(imgs):
@@ -530,60 +581,61 @@ def handle_chat(chat_history, user_message, data_preview):
             # Histogram
             if "hist" in args:
                 p = args["hist"]
-                title, im = plot_hist(df, p.get("col"), int(p.get("bins", 30)))
-                image_paths.append(save_image_np(im, f"plot_hist_{p.get('col')}.png"))
+                col = _rg(p.get("col"))
+                title, im = plot_hist(df, col, int(p.get("bins", 30)))
+                image_paths.append(save_image_np(im, f"plot_hist_{str(col)}.png"))
                 sections.append((title, "", im))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": f"{title} generated."}])
 
             # Box
             if "box" in args:
-                p = args["box"]; grp = p.get("group")
+                p = args["box"]; val = _rg(p.get("value")); grp = _rg(p.get("group"))
                 if grp is None:
                     _, groups = need_value_and_group(df)
-                    ask = "Which group column for the box plot? Candidates: " + ", ".join(groups)
+                    ask = "Which group column for the box plot? Candidates: " + ", ".join(map(str, groups))
                     chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                     preview, paths, idx = _safe_last([])
                     return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
-                if p.get("value") == grp:
+                if val == grp:
                     raise gr.Error("Outcome and group must be different.")
-                title, im = plot_box(df, p.get("value"), grp)
-                image_paths.append(save_image_np(im, f"plot_box_{p.get('value')}_{grp}.png"))
+                title, im = plot_box(df, val, grp)
+                image_paths.append(save_image_np(im, f"plot_box_{str(val)}_{str(grp)}.png"))
                 sections.append((title, "", im))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": f"{title} generated."}])
 
             # Violin
             if "violin" in args:
-                p = args["violin"]; grp = p.get("group")
+                p = args["violin"]; val = _rg(p.get("value")); grp = _rg(p.get("group"))
                 if grp is None:
                     _, groups = need_value_and_group(df)
-                    ask = "Which group column for the violin plot? Candidates: " + ", ".join(groups)
+                    ask = "Which group column for the violin plot? Candidates: " + ", ".join(map(str, groups))
                     chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                     preview, paths, idx = _safe_last([])
                     return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
-                if p.get("value") == grp:
+                if val == grp:
                     raise gr.Error("Outcome and group must be different.")
-                title, im = plot_violin(df, p.get("value"), grp)
-                image_paths.append(save_image_np(im, f"plot_violin_{p.get('value')}_{grp}.png"))
+                title, im = plot_violin(df, val, grp)
+                image_paths.append(save_image_np(im, f"plot_violin_{str(val)}_{str(grp)}.png"))
                 sections.append((title, "", im))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": f"{title} generated."}])
 
             # Bar
             if "bar" in args:
-                p = args["bar"]; grp = p.get("group")
+                p = args["bar"]; val = _rg(p.get("value")); grp = _rg(p.get("group"))
                 if grp is None:
                     _, groups = need_value_and_group(df)
-                    ask = "Which group column for the bar chart? Candidates: " + ", ".join(groups)
+                    ask = "Which group column for the bar chart? Candidates: " + ", ".join(map(str, groups))
                     chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": ask}])
                     preview, paths, idx = _safe_last([])
                     return (chat_history, gr.update(value=preview), gr.update(value=None, visible=False), data_preview, paths, idx)
-                if p.get("value") == grp:
+                if val == grp:
                     raise gr.Error("Outcome and group must be different.")
                 err = p.get("error", "sem")
-                from plot_helpers import bar_with_error_plot  # local import to avoid circulars
+                # Use stable ordering inferred by helper
                 gorder = df[grp].dropna().astype(str).unique().tolist()
-                im = bar_with_error_plot(df, p.get("value"), grp, error=err, gorder=gorder)
-                image_paths.append(save_image_np(im, f"plot_bar_{p.get('value')}_{grp}_{err}.png"))
-                sections.append((f"Bar {p.get('value')}~{grp}", "", im))
+                im = bar_with_error_plot(df, val, grp, error=err, gorder=gorder)
+                image_paths.append(save_image_np(im, f"plot_bar_{str(val)}_{str(grp)}_{err}.png"))
+                sections.append((f"Bar {str(val)}~{str(grp)}", "", im))
                 chat_history.extend(
                     [{"role": "user", "content": text}, {"role": "assistant", "content": f"Bar ± {str(err).upper()} generated."}]
                 )
@@ -592,8 +644,9 @@ def handle_chat(chat_history, user_message, data_preview):
         elif action == "check":
             if "normality" in args:
                 p = args["normality"]
-                msg, im = check_normality(df, p.get("col"))
-                image_paths.append(save_image_np(im, f"plot_qq_{p.get('col')}.png"))
+                col = _rg(p.get("col"))
+                msg, im = check_normality(df, col)
+                image_paths.append(save_image_np(im, f"plot_qq_{str(col)}.png"))
                 sections.append(("Normality", msg, im))
                 chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
 
@@ -658,7 +711,7 @@ def on_next(paths, idx):
     return gr.update(value=preview), new_idx
 
 # --------------------------
-# UI  (layout unchanged)
+# UI (unchanged layout)
 # --------------------------
 with gr.Blocks(title="SpatChat: Stats Room") as demo:
     gr.Image(
