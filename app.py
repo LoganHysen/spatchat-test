@@ -249,10 +249,11 @@ def handle_chat(chat_history, user_message, data_preview):
         if action == "summary":
             col = args.get("col")
             by = args.get("by")
-            if col not in df.columns:
+            special_all = {"*", "data", "dataset", "everything"}
+        
+            if col not in df.columns and str(col).strip().lower() not in special_all:
                 raise gr.Error(f"Column '{col}' not found.")
-            if by is not None and by not in df.columns:
-                raise gr.Error(f"Group column '{by}' not found.")
+        
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
