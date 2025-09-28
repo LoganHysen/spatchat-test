@@ -22,12 +22,24 @@ __all__ = [
     "check_normality",
 ]
 
-# ---------- internal util ----------
+# ---------- internal utils ----------
 def _summ_one(series: pd.Series) -> str:
     s = pd.to_numeric(series, errors="coerce").dropna().astype(float)
     if len(s) == 0:
         return "n=0"
     return f"n={len(s)}, mean={s.mean():.4g}, sd={s.std(ddof=1):.4g}, min={s.min():.4g}, max={s.max():.4g}"
+
+def _group_order(df: pd.DataFrame, by: str) -> List[str]:
+    sby = df[by]
+    if pd.api.types.is_categorical_dtype(sby):
+        return [str(x) for x in sby.cat.categories]
+    # Stable lexicographic order of first-seen unique labels; no numeric casting
+    seen: List[str] = []
+    for v in sby.dropna():
+        sv = str(v)
+        if sv not in seen:
+            seen.append(sv)
+    return sorted(seen, key=lambda x: (x.lower(), x))
 
 # ---------- summaries ----------
 def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
@@ -61,15 +73,7 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
                 lines.append(f"- {c}: {_summ_one(df[c])}")
         else:
             lines.append(f"Summary of all numeric columns by {by}:")
-            sby = df[by]
-            if pd.api.types.is_categorical_dtype(sby):
-                order = [str(x) for x in sby.cat.categories]
-            else:
-                order = [str(v) for v in df[by].dropna().unique().tolist()]
-                try:
-                    order = [x for _, x in sorted(zip([float(v) for v in order], order), key=lambda t: t[0])]
-                except Exception:
-                    order = sorted(order, key=lambda x: (x.lower(), x))
+            order = _group_order(df, by)
             for g in order:
                 lines.append(f"- {by} = {g}:")
                 block = df[df[by].astype(str) == g]
@@ -93,15 +97,7 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
         return f"Top categories of {col} (overall):\n" + "\n".join([f"- {k}: {int(v)}" for k, v in vc.items()])
 
     # With grouping
-    sby = df[by]
-    if pd.api.types.is_categorical_dtype(sby):
-        order = [str(x) for x in sby.cat.categories]
-    else:
-        order = [str(v) for v in df[by].dropna().unique().tolist()]
-        try:
-            order = [x for _, x in sorted(zip([float(v) for v in order], order), key=lambda t: t[0])]
-        except Exception:
-            order = sorted(order, key=lambda x: (x.lower(), x))
+    order = _group_order(df, by)
 
     if is_numlike:
         lines = [f"Summary of {col} by {by}:"]
@@ -138,7 +134,6 @@ def plot_violin(df: pd.DataFrame, value: str, group: str) -> Tuple[str, np.ndarr
 
 def check_normality(df: pd.DataFrame, col: str) -> Tuple[str, np.ndarray]:
     series = pd.to_numeric(df[col], errors="coerce").dropna().astype(float)
-    # Shapiro only reliable for 3–5000
     if 3 <= len(series) <= 5000:
         W, p = stats.shapiro(series)
         msg = f"Shapiro–Wilk normality on {col} (n={len(series)}): W={W:.4g}, p={p:.5g}"
