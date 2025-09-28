@@ -89,7 +89,7 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
         vc = series.dropna().astype(str).value_counts().head(10)
         if vc.empty:
             return f"Summary of {col}: n=0"
-        return "Top categories of {col} (overall):\n" + "\n".join([f"- {k}: {int(v)}" for k, v in vc.items()]).format(col=col)
+        return f"Top categories of {col} (overall):\n" + "\n".join([f"- {k}: {int(v)}" for k, v in vc.items()])
 
     # With grouping
     sby = df[by]
@@ -116,5 +116,5 @@ def quick_summary(df: pd.DataFrame, col: str, by: Optional[str] = None) -> str:
         if vc.empty:
             lines.append(f"- {g}: n=0")
         else:
-            lines.append(f"- {g}: " + ", ".join([f\"{k} ({int(v)})\" for k, v in vc.items()]))
+            lines.append(f"- {g}: " + ", ".join([f"{k} ({int(v)})" for k, v in vc.items()]))
     return "\n".join(lines)
