@@ -15,7 +15,6 @@ from plot_helpers import (
 )
 
 __all__ = [
-    "quick_summary",
     "plot_hist",
     "plot_box",
     "plot_violin",
