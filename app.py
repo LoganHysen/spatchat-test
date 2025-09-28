@@ -250,16 +250,19 @@ def handle_chat(chat_history, user_message, data_preview):
 
     parsed = None
     llm_error_text = None
-    try:
-        tool, _ = ask_llm(chat_history, text)
-        parsed = tool
-    except Exception as e:
-        llm_error_text = f"(LLM unavailable: {e})"
 
+    # ---- NEW: Local parse first to avoid LLM overriding simple summaries ----
+    lp = local_parse(text)
+    if lp:
+        parsed = lp
+
+    # If no local parse match, try the LLM
     if not parsed:
-        lp = local_parse(text)
-        if lp:
-            parsed = lp
+        try:
+            tool, _ = ask_llm(chat_history, text)
+            parsed = tool
+        except Exception as e:
+            llm_error_text = f"(LLM unavailable: {e})"
 
     if pending["action"] and parsed and parsed.get("tool") == "stats":
         pending = {"action": None, "need": None, "args": None}
@@ -321,6 +324,7 @@ def handle_chat(chat_history, user_message, data_preview):
             by  = _rg(args.get("by"))
             if col is None or str(col).strip().lower() in _SPECIAL_WHOLE_DATA:
                 col = "data"
+            print(f"[DEBUG] quick_summary called with col={col}, by={by}")  # <--- keep your debug
             msg = quick_summary(df, col, by)
             sections.append(("Summary", msg, None))
             chat_history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": _fence(msg)}])
