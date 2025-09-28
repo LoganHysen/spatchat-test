@@ -130,6 +130,15 @@ def _split_controls(s: str) -> List[str]:
 
 def local_parse(user_input: str) -> Optional[Dict]:
     s = user_input.strip().lower()
+    
+    # Handle: "summarize data by sex" / "summarize dataset by Sex" / "summarize by Sex"
+    m = re.search(r"\b(summarize|summary|describe)\s+(?:the\s+)?(data|dataset|everything|\*)\s+(?:by|across)\s+([a-zA-Z0-9_]+)", s)
+    if m:
+        return {"tool": "stats", "action": "summary", "args": {"col": "*", "by": m.group(3)}}
+    
+    m = re.search(r"\b(summarize|summary|describe)\s+(?:by|across)\s+([a-zA-Z0-9_]+)", s)
+    if m:
+        return {"tool": "stats", "action": "summary", "args": {"col": "*", "by": m.group(2)}}
 
     if re.search(r"\b(what can i do|how should i analyze|recommend|suggestion|what analyses)\b", s):
         return {"tool": "stats", "action": "recommend", "args": {}}
