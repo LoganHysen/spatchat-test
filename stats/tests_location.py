@@ -12,8 +12,14 @@ from plot_helpers import (
     box_plot,
     violin_plot,
     fig_to_np,
-    scatter_with_reg,
 )
+
+# Optional visual overlay for significance on bar plots
+try:
+    from viz_annotations import annotate_ttest_on_bar as _annotate_bar
+except Exception:
+    _annotate_bar = None
+
 
 # ---------- Effect sizes & helpers ----------
 def _cohen_d_independent_from_arrays(a: np.ndarray, b: np.ndarray, equal_var: bool = False) -> Tuple[float, float]:
@@ -66,15 +72,13 @@ def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=Fals
     except Exception:
         ci_low = ci_high = np.nan
 
-    # Cohen's d (pooled) + Hedges' g for independent-samples case
+    # Cohen's d (pooled) + Hedges' g for independent-samples; paired uses dz
     if not paired:
         d, g = _cohen_d_independent_from_arrays(a, b, equal_var=equal_var)
     else:
-        # For paired, report Cohen's dz using SD of differences
         diffs = a - b
         sd_diff = np.std(diffs, ddof=1) if len(diffs) > 1 else np.nan
         d = (np.mean(diffs) / sd_diff) if (sd_diff and sd_diff > 0) else np.nan
-        # small-sample correction (approx) using n-1 df
         J = 1 - (3 / (4 * (len(diffs) - 1) - 1)) if (len(diffs) - 1) > 1 else 1.0
         g = d * J if np.isfinite(d) else np.nan
 
@@ -92,20 +96,41 @@ def ttest_summary(a: np.ndarray, b: np.ndarray, g1: str, g2: str, equal_var=Fals
 def run_ttest(
     df: pd.DataFrame, value: str, group: str, paired: bool = False, equal_var: bool = False
 ) -> Tuple[str, List[np.ndarray]]:
+    """
+    Compute two-sample t-test (Welch by default) or paired t-test.
+    Returns (text, [bar±SEM, box, violin]) — signature unchanged.
+    If viz_annotations.py is present, the first image is auto-annotated with p-value.
+    """
     gorder = ordered_groups(df, group)
     if len(gorder) != 2:
         raise ValueError(f"t-test requires exactly 2 groups; {group} has {len(gorder)} levels.")
 
-    a = df[df[group].astype(str) == gorder[0]][value].dropna().astype(float).values
-    b = df[df[group].astype(str) == gorder[1]][value].dropna().astype(float).values
+    g1, g2 = gorder[0], gorder[1]
+    a = df[df[group].astype(str) == g1][value].dropna().astype(float).values
+    b = df[df[group].astype(str) == g2][value].dropna().astype(float).values
 
-    # Figures
+    # Base visuals
     img_bar = bar_with_error_plot(df, value, group, error="sem", gorder=gorder)
     img_box = box_plot(df, value, group)
     img_vio = violin_plot(df, value, group)
 
-    # Stats
-    txt = ttest_summary(a, b, gorder[0], gorder[1], equal_var=equal_var, paired=paired)
+    # Stats + (optional) annotated overlay for the bar plot
+    txt = ttest_summary(a, b, g1, g2, equal_var=equal_var, paired=paired)
+
+    # Recompute p here to overlay (ttest_summary does not return it)
+    try:
+        if paired:
+            stat, p = stats.ttest_rel(a, b, nan_policy="omit")
+            note = "Paired t-test"
+        else:
+            stat, p = stats.ttest_ind(a, b, equal_var=equal_var, nan_policy="omit")
+            note = "Student t-test" if equal_var else "Welch t-test"
+        if _annotate_bar is not None and np.isfinite(p):
+            img_bar = _annotate_bar(df, value, group, g1, g2, float(p), note=note)
+    except Exception:
+        # If anything goes wrong, silently keep the un-annotated bar
+        pass
+
     return txt, [img_bar, img_box, img_vio]
 
 
@@ -193,13 +218,17 @@ def point_biserial(df: pd.DataFrame, value: str, group: str) -> Tuple[str, List[
 
     # Fisher z CI for r
     if len(d) > 3 and np.isfinite(r) and not np.isclose(abs(r), 1.0):
-        z = np.arctanh(r); se = 1 / np.sqrt(len(d) - 3); zcrit = stats.norm.ppf(0.975)
+        z = np.arctanh(r)
+        se = 1 / np.sqrt(len(d) - 3)
+        zcrit = stats.norm.ppf(0.975)
         ci = (np.tanh(z - zcrit * se), np.tanh(z + zcrit * se))
     else:
         ci = (np.nan, np.nan)
 
-    lines = [f"Point-biserial correlation between {value} and {group}",
-             f"n={len(d)}, r = {float(r):.4g}, p = {float(p):.5g}"]
+    lines = [
+        f"Point-biserial correlation between {value} and {group}",
+        f"n={len(d)}, r = {float(r):.4g}, p = {float(p):.5g}",
+    ]
     if np.all(np.isfinite(ci)):
         lines.append(f"95% CI for r: [{ci[0]:.3g}, {ci[1]:.3g}]")
 
