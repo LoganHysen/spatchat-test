@@ -14,7 +14,7 @@ load_dotenv()
 # Providers
 from huggingface_hub import InferenceClient
 from together import Together
-from together.error import RateLimitError, ServiceUnavailableError
+from together.error import RateLimitError
 
 # --------------------------
 # Prompts (unchanged semantics)
@@ -181,7 +181,7 @@ class UnifiedLLM:
                         stream=stream,
                     )
                     return _choice_content(resp.choices[0])
-                except (RateLimitError, ServiceUnavailableError):
+                except RateLimitError:
                     if attempt == 3:
                         raise
                     time.sleep(backoff + random.uniform(0, 3))
