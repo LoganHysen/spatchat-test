@@ -818,4 +818,6 @@ If you use SpatChat in research, please cite:<br>
 
 
 if __name__ == "__main__":
-    demo.launch(ssr_mode=False)
+    demo.launch(ssr_mode=False, 
+                server_name="0.0.0.0", 
+                server_port=int(os.environ.get("PORT", 7860)))
